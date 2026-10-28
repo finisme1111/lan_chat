@@ -1,0 +1,4 @@
+# LAN Chat & File Sharing P2P - Dependencies
+# Cài đặt: pip install -r requirements.txt
+prompt_toolkit>=3.0.0
+
