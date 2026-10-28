@@ -181,7 +181,7 @@ def display_peer_list():
             badges.append(f"💬 {unread} chưa đọc")
         badge_str = f"  [{', '.join(badges)}]" if badges else ""
 
-        status_icon = "🟢" if peer.status == "available" else "🔴"
+        status_icon = "🟢" if peer.status == "available" else ("🟡" if peer.status == "away" else "🔴")
         print_formatted_text(
             HTML(
                 f"  <b>{i}.</b> <peer>{html_lib.escape(peer.name)}</peer>"
@@ -310,7 +310,7 @@ class LanChatCompleter(Completer):
 
         # /status <trạng thái>
         elif cmd == "/status":
-            for s in ("available", "busy"):
+            for s in ("available", "busy", "away"):
                 if s.startswith(arg):
                     yield Completion(s, start_position=-len(arg))
 

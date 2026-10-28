@@ -1,15 +1,17 @@
 """
 models.py - Cấu trúc dữ liệu và trạng thái chia sẻ toàn cục (Shared State)
 
-Tại sao cần module này?
-- Nhiều luồng (thread) cùng đọc/ghi danh sách peer → cần Lock để tránh race condition.
-- Tập trung dữ liệu vào 1 chỗ → dễ debug, không bị circular import.
+Mục đích:
+- Lưu trữ danh sách peer online, lịch sử chat, các kết nối TCP đang mở.
+- Thread-safe tuyệt đối: sử dụng threading.Lock() (Mutex) cho dữ liệu chia sẻ
+  và conn_lock riêng biệt cho socket connections để tránh deadlock.
+- Tương thích đa nền tảng: Linux & Windows.
 """
 
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -19,15 +21,14 @@ from typing import Any, Dict, Optional
 @dataclass
 class Peer:
     """
-    Đại diện cho một người dùng khác đang online trong mạng LAN.
+    Đại diện cho một người dùng khác trong mạng LAN.
 
     Attributes:
-        name:      Tên hiển thị của peer (nhận từ gói UDP HELLO).
-        ip:        Địa chỉ IP của peer (lấy từ địa chỉ gói UDP đến).
-        tcp_port:  Port TCP mà peer đang lắng nghe kết nối chat.
-        status:    Trạng thái hiện tại: "available" | "busy".
-        last_seen: Timestamp (time.time()) lần cuối nhận gói HELLO từ peer.
-                   Dùng để phát hiện peer timeout (> 10 giây không thấy = offline).
+        name:      Tên hiển thị của peer (từ gói UDP HELLO).
+        ip:        Địa chỉ IP của peer.
+        tcp_port:  Port TCP mà peer lắng nghe kết nối.
+        status:    Trạng thái: "available" | "busy".
+        last_seen: Timestamp (time.time()) lần cuối nhận HELLO.
     """
     name: str
     ip: str
@@ -36,84 +37,65 @@ class Peer:
     last_seen: float = field(default_factory=time.time)
 
     def is_timed_out(self, timeout_sec: float = 10.0) -> bool:
-        """Trả về True nếu peer không gửi HELLO trong vòng timeout_sec giây."""
+        """Kiểm tra peer đã quá thời gian chờ (10s không gửi HELLO) hay chưa."""
         return (time.time() - self.last_seen) > timeout_sec
 
     def __str__(self) -> str:
-        status_icon = "🟢" if self.status == "available" else "🔴"
+        status_icon = "🟢" if self.status == "available" else ("🟡" if self.status == "away" else "🔴")
         return f"{status_icon} {self.name} ({self.ip}:{self.tcp_port}) [{self.status}]"
 
 
 # ---------------------------------------------------------------------------
-# Shared State - Trạng thái chia sẻ giữa các luồng
+# Shared State - Singleton Thread-safe
 # ---------------------------------------------------------------------------
 
 class SharedState:
     """
-    Singleton chứa toàn bộ trạng thái runtime của ứng dụng.
-
-    Thiết kế:
-    - Dùng threading.Lock() (Mutex) để bảo vệ peer_list và chat_history.
-    - Lock phải được acquire() trước khi đọc/ghi, release() sau khi xong.
-    - Dùng 'with self.lock:' để đảm bảo Lock luôn được giải phóng kể cả khi có exception.
+    Quản lý toàn bộ trạng thái runtime của ứng dụng.
+    Tất cả các thao tác đọc/ghi vào dữ liệu chia sẻ đều được bảo vệ bởi Lock.
     """
 
     def __init__(self):
-        # --- Thông tin của bản thân (được set bởi main.py khi khởi động) ---
+        # Thông tin của chính mình
         self.my_name: str = ""
         self.my_tcp_port: int = 0
         self.my_ip: str = ""
-
-        # Trạng thái của bản thân: "available" | "busy"
-        # "busy" khi đang trong cuộc chat với ai đó
         self.my_status: str = "available"
 
-        # --- Danh sách peer online ---
-        # Key: "ip:tcp_port" (định danh duy nhất cho mỗi peer)
-        # Value: đối tượng Peer
-        # PHẢI dùng self.lock khi truy cập dict này!
+        # Danh sách peer online: key = "ip:tcp_port", value = Peer
         self.peer_list: Dict[str, Peer] = {}
 
-        # --- Partner hiện tại đang chat ---
-        # None nếu không đang chat với ai
-        self.current_partner: Optional[str] = None  # key trong peer_list
+        # Khóa của partner hiện đang chat cùng (hoặc None nếu đang ở màn hình ngoài)
+        self.current_partner: Optional[str] = None
 
-        # --- Lock bảo vệ dữ liệu chia sẻ ---
-        # threading.Lock() là Mutual Exclusion lock (Mutex):
-        # - Chỉ 1 luồng được giữ lock tại 1 thời điểm.
-        # - Luồng khác gọi acquire() sẽ bị block cho đến khi lock được release().
+        # Lock bảo vệ peer_list, chat_history, unread_counts
         self.lock: threading.Lock = threading.Lock()
 
-        # --- Lịch sử chat ---
-        # Key: peer_key ("ip:port"), Value: list[str] (các dòng chat)
-        self.chat_history: Dict[str, list] = {}
+        # Lịch sử chat theo từng peer_key
+        self.chat_history: Dict[str, List[str]] = {}
 
-        # --- Unread message count ---
-        # Key: peer_key, Value: int (số tin nhắn chưa đọc)
+        # Số tin nhắn chưa đọc
         self.unread_counts: Dict[str, int] = {}
 
-        # --- Flag để dừng các luồng khi thoát ---
-        # threading.Event() cho phép một luồng ra hiệu (set) cho luồng khác (wait/is_set).
+        # Event báo hiệu dừng toàn bộ các luồng khi /quit
         self.stop_event: threading.Event = threading.Event()
 
-        # --- Kết nối TCP đang mở ---
-        # Key: peer_key ("ip:port"), Value: socket.socket
-        # Kết nối KHÔNG bị đóng khi /leave — chỉ đóng khi lỗi mạng hoặc /quit.
-        # Dùng conn_lock riêng biệt để tránh deadlock với self.lock.
+        # Quản lý kết nối TCP (giữ kết nối để tái sử dụng)
+        # conn_lock tách rời để tránh contention/deadlock với data lock
         self.connections: Dict[str, Any] = {}
         self.conn_lock: threading.Lock = threading.Lock()
 
-    # --- Các hàm helper an toàn (thread-safe) ---
+    # --- Các hàm thao tác thread-safe ---
 
-    def get_peer_key(self, ip: str, tcp_port: int) -> str:
-        """Tạo khóa duy nhất cho peer."""
+    @staticmethod
+    def get_peer_key(ip: str, tcp_port: int) -> str:
+        """Tạo khóa định danh duy nhất cho peer."""
         return f"{ip}:{tcp_port}"
 
     def upsert_peer(self, name: str, ip: str, tcp_port: int, status: str) -> bool:
         """
-        Thêm peer mới hoặc cập nhật thông tin peer đã có.
-        Trả về True nếu đây là peer MỚI (để UI có thể thông báo).
-        Thread-safe: dùng lock nội bộ.
+        Cập nhật hoặc thêm mới peer.
+        Trả về True nếu đây là peer mới tham gia mạng.
         """
         key = self.get_peer_key(ip, tcp_port)
         with self.lock:
@@ -122,25 +104,22 @@ class SharedState:
                 self.peer_list[key] = Peer(
                     name=name, ip=ip, tcp_port=tcp_port, status=status
                 )
-                # Khởi tạo lịch sử và unread count CHỈ KHI chưa có.
-                # Không ghi đè lịch sử đã được load từ file bởi history.load_history().
+                # Chỉ khởi tạo nếu chưa có trong history (tránh ghi đè khi đã load từ JSON)
                 if key not in self.chat_history:
                     self.chat_history[key] = []
                 if key not in self.unread_counts:
                     self.unread_counts[key] = 0
             else:
-                # Chỉ cập nhật các trường thay đổi
                 peer = self.peer_list[key]
                 peer.name = name
                 peer.status = status
                 peer.last_seen = time.time()
             return is_new
 
-    def remove_timed_out_peers(self) -> list:
+    def remove_timed_out_peers(self) -> List[str]:
         """
-        Xóa các peer đã timeout khỏi danh sách.
-        Trả về danh sách tên các peer bị xóa (để hiển thị thông báo).
-        Thread-safe.
+        Xóa các peer không còn hoạt động (>10s không có HELLO).
+        Trả về danh sách tên các peer đã bị loại bỏ.
         """
         removed = []
         with self.lock:
@@ -148,33 +127,32 @@ class SharedState:
                 k for k, p in self.peer_list.items() if p.is_timed_out()
             ]
             for key in timed_out_keys:
-                removed.append(self.peer_list[key].name)
-                del self.peer_list[key]
-                # Nếu peer đang được chat thì xóa trạng thái partner
+                peer = self.peer_list.pop(key, None)
+                if peer:
+                    removed.append(peer.name)
+                # Đưa về dấu nhắc chính nếu partner bị timeout
                 if self.current_partner == key:
                     self.current_partner = None
         return removed
 
-    def get_peer_list_snapshot(self) -> list:
-        """
-        Trả về bản sao (snapshot) danh sách peer tại thời điểm gọi.
-        Dùng snapshot thay vì trả về dict trực tiếp để tránh race condition
-        khi luồng khác sửa dict trong lúc đang duyệt.
-        """
+    def get_peer_list_snapshot(self) -> List[Peer]:
+        """Lấy bản sao danh sách peer an toàn (shallow copy)."""
         with self.lock:
             return list(self.peer_list.values())
 
     def set_status(self, status: str):
-        """Cập nhật trạng thái của bản thân một cách thread-safe."""
+        """Thay đổi trạng thái cá nhân (available | busy)."""
         with self.lock:
             self.my_status = status
 
+    def reset_partner_if(self, peer_key: str):
+        """
+        Đưa dấu nhắc lệnh về trạng thái chính nếu đối tác đang chat bị ngắt kết nối.
+        """
+        with self.lock:
+            if self.current_partner == peer_key:
+                self.current_partner = None
 
-# ---------------------------------------------------------------------------
-# Singleton instance - Dùng toàn dự án
-# ---------------------------------------------------------------------------
 
-# Tất cả các module khác sẽ import state từ đây:
-#   from models import state
+# Khởi tạo singleton dùng chung toàn dự án
 state = SharedState()
-
