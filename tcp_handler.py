@@ -546,6 +546,7 @@ def _handle_incoming(conn: socket.socket, addr: Tuple[str, int]):
                 if _register_chat_connection(peer_key, peer_ip, peer_tcp_port, candidate) is not candidate:
                     return
 
+                _restore_selected_peer(peer_key, expected_socket=conn)
                 logger.info(f"[TCP] Chấp nhận kết nối CHAT từ {peer_name} ({peer_key})")
                 if _system_cb:
                     _system_cb(f"[*] {peer_name} đã kết nối vào trò chuyện.")
@@ -842,6 +843,24 @@ def stop_file_sender(timeout: float = 2.0) -> bool:
 # Luồng Auto-reconnect
 # ---------------------------------------------------------------------------
 
+def _restore_selected_peer(peer_key: str, *, expected_socket: socket.socket | None = None):
+    with state.conn_lock:
+        connection = state.connections.get(peer_key)
+        if connection is None or (expected_socket is not None and connection.sock is not expected_socket):
+            return
+        with state.lock:
+            peer = state.peer_list.get(peer_key)
+            if (
+                state.stop_event.is_set() or state.reconnect_partner != peer_key
+                or peer is None or state.current_partner is not None
+            ):
+                return
+            state.current_partner = peer_key
+            name = peer.name
+    if _system_cb:
+        _system_cb(f"[*] Đã tự động kết nối lại thành công với {name}.")
+
+
 def _reconnect_selected_peer():
     with state.conn_lock:
         with state.lock:
@@ -851,21 +870,8 @@ def _reconnect_selected_peer():
             if state.current_partner == partner and partner in state.connections:
                 return
 
-    if get_or_connect(partner) is None:
-        return
-
-    with state.conn_lock:
-        with state.lock:
-            peer = state.peer_list.get(partner)
-            if (
-                state.stop_event.is_set() or state.reconnect_partner != partner or peer is None
-                or partner not in state.connections or state.current_partner == partner
-            ):
-                return
-            state.current_partner = partner
-            name = peer.name
-    if _system_cb:
-        _system_cb(f"[*] Đã tự động kết nối lại thành công với {name}.")
+    if get_or_connect(partner) is not None:
+        _restore_selected_peer(partner)
 
 
 def _reconnect_worker():

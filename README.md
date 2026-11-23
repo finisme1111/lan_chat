@@ -222,9 +222,81 @@ python3 -B -m unittest discover -s tests -v
 python3 -B run_auto_test.py
 ```
 
-Unit tests bao gồm socket ownership, giới hạn framing, timeout, hủy transfer, storage, command parsing và prompt redraw. Smoke test chạy hai subprocess trên IPv4 loopback với cổng động và thư mục tạm riêng. Các kịch bản có broadcast, kiểm tra SHA-256, từ chối khi vượt quota và lưu history sau `/quit`. Script trả exit code khác 0 khi có lỗi.
+Regression tests bao gồm socket ownership, framing, timeout, storage, command parsing và redraw qua pipe input và POSIX PTY. PTY test kiểm tra ANSI output, draft, cursor và thông báo unread.
 
-Để demo trên hai máy, chạy hai instance cùng LAN, thử discovery, trạng thái, tin nhắn và gửi file khi đang chat. Trong Wireshark, lọc `udp.port == 9999` rồi chọn TCP stream để xác nhận SYN, SYN-ACK, ACK và application HELLO.
+Integration harness chạy ba subprocess trên IPv4 loopback với cổng động và data directory tạm riêng. Subprocess nhận lệnh từng dòng để kiểm tra CLI và network; regression PTY kiểm tra phần render. Harness dùng gate để buộc hai peer cùng dial trước khi gửi HELLO và giữ upload sau chunk đầu tiên trong khi kiểm tra chat. Fault injection chỉ hoạt động trong test subprocess. Script trả exit code khác 0 khi có lỗi.
+
+### Kiểm tra thủ công trên hai máy cùng LAN
+
+**UNVERIFIED.** Đang chờ đồng đội có máy thứ hai để chạy các bước dưới đây trên mạng LAN thực tế.
+
+Chạy từ thư mục repository tương ứng trên mỗi máy, với Python và dependency đã sẵn có. Dùng Wi-Fi hoặc Ethernet thuộc cùng IPv4 subnet. Nếu hai máy cùng SSID nhưng không thấy nhau, kiểm tra guest network, AP isolation và firewall. Cho phép nhận UDP **9999** và TCP port của tiến trình trên interface LAN, trong phạm vi hai máy thử nghiệm. `--port` cấu hình TCP listener. UDP discovery gửi broadcast mỗi khoảng 3 giây và peer hết hạn sau khoảng 10 giây không nhận HELLO.
+
+**Máy A**
+
+```bash
+lan_a_data=$(mktemp -d -t lan-chat-A.XXXXXX)
+dd if=/dev/urandom of="$lan_a_data/qa-file.bin" bs=1M count=5 status=none
+printf 'File thử nghiệm: %s\n' "$lan_a_data/qa-file.bin"
+sha256sum "$lan_a_data/qa-file.bin"
+python3 -B main.py --name QA-A --port 5001 --data-dir "$lan_a_data" --debug
+```
+
+**Máy B**
+
+```bash
+lan_b_data=$(mktemp -d -t lan-chat-B.XXXXXX)
+printf 'Data directory: %s\n' "$lan_b_data"
+python3 -B main.py --name QA-B --port 5002 --data-dir "$lan_b_data" --debug
+```
+
+1. Trên cả hai máy, dùng `/list` và kiểm tra tên, IP LAN và TCP port của máy kia. Đổi `/status away` rồi `/status online` trên B. Kiểm tra A thấy mỗi lần đổi sau một chu kỳ broadcast.
+2. Gần như đồng thời, dùng `/chat QA-B` trên A và `/chat QA-A` trên B. Gửi hai tin khác nhau, ví dụ `A → B | kiểm thử UTF-8` và `B → A | kiểm thử UTF-8`. Xác nhận mỗi tin xuất hiện một lần ở đúng đầu nhận.
+3. Trên A, dùng `/send <đường dẫn tuyệt đối tới qa-file.bin>`. Xác nhận thông báo của A ghi B đã lưu file và so SHA-256 trên B bằng `sha256sum "$lan_b_data/downloads/qa-file.bin"` sau khi quay lại shell. Khi cần kiểm tra chat đồng thời bằng tay, dùng file tổng hợp đủ lớn để kịp gửi tin hai chiều trước ACK.
+4. Trên B, dùng `/quit` khi chat đang mở. A phải báo ngắt TCP, rồi hiển thị B offline trong `/list` sau khoảng 10–12 giây kể từ HELLO cuối. Sau `/quit` ở A, kiểm tra `chat_history.json` ở hai data directory đã in.
+5. Khi discovery thất bại, ghi nhận IP và interface LAN của hai máy, ví dụ bằng `ip -br -4 addr` trên Linux. Kiểm tra listener bằng `ss -ltn` và kiểm tra capture ở bước dưới để xác định UDP broadcast có tới máy nhận và TCP handshake có hoàn tất hay không.
+
+### Checklist Kitty
+
+Chạy hai lệnh trên từ Kitty để kiểm tra redraw trực tiếp. Có thể thêm peer thử `QA-C` trên Linux với port `5003` và một data directory tạm riêng để kiểm tra tin từ hội thoại khác.
+
+1. Dùng `/list`, `/status away`, `/status online` và `/chat <tên hoặc số>`. Kiểm tra prompt hiển thị đúng trạng thái và tên peer sau mỗi thao tác.
+2. Trên A, đang chat với B, gõ `abcd` và nhấn ← hai lần. Giữ nguyên draft. B gửi `kitty-active`. Xác nhận tin xuất hiện phía trên prompt, draft vẫn là `abcd` và cursor vẫn ở giữa `b` và `c`.
+3. Khi draft vẫn đang mở, C dùng `/chat QA-A` rồi gửi `kitty-unread`. Xác nhận A thấy thông báo từ C và vẫn giữ draft. Chèn `X` rồi Enter. B phải nhận chính xác `abXcd`. Dùng `/list` để xem `1 chưa đọc` ở C, sau đó `/chat QA-C` và `/list` để xác nhận lịch sử hiện tin và badge biến mất.
+4. Nếu chỉ có hai peer, hoàn tất bước gửi `abXcd` trước. Trên A dùng `/leave` và bắt đầu gõ `/chat QA-B` mà chưa Enter. B gửi `kitty-unread` trên TCP connection còn mở. Kiểm tra draft tại A, nhấn Enter để đọc tin và dùng `/list` để xác nhận badge unread biến mất. Trường hợp ba peer vẫn được kiểm tra riêng trong integration harness.
+5. Dùng `/leave`, chọn lại B, rồi `/send <file tổng hợp>`. Trong lúc hiển thị progress, gõ draft khác và kiểm tra redraw. Dùng `/quit` để xác nhận prompt thoát sạch.
+
+**Kết quả Phase 3 · PASS trên Kitty thật**, với hai cửa sổ trên cùng máy Arch Linux/Hyprland. Người kiểm thử xác nhận discovery, đổi trạng thái, chat UTF-8 hai chiều, giữ draft và cursor khi nhận tin hoặc tiến độ file, unread sau `/leave`, và thoát sạch. Lượt gửi file 16 MiB đã đạt progress 100%, có `FILE_ACK` và SHA-256 khớp.
+
+### Wireshark
+
+**UNVERIFIED.** Chưa thực hiện capture Wireshark thật. Khi có lượt kiểm thử LAN, ghi lại số frame TCP handshake và số stream cho chat và file.
+
+1. Trên một trong hai máy, chọn interface IPv4 LAN đang dùng và bắt đầu capture trước khi mở app. Capture filter cho cổng trong ví dụ là `udp port 9999 or tcp port 5001 or tcp port 5002`. Dùng dữ liệu tổng hợp và lưu `.pcapng` ngoài repository. [Capture filters](https://wiki.wireshark.org/CaptureFilters)
+2. Áp display filter `udp.dstport == 9999`. Mở UDP payload và ghi lại địa chỉ nguồn, đích broadcast, cặp `HELLO`/`HELLO2`, advertised TCP port, presence và UUID. Để đo chu kỳ, so thời gian giữa hai gói cùng loại từ cùng nguồn trên một interface. `available` là giá trị wire cho trạng thái `online`.
+3. Dùng `(tcp.port == 5001 || tcp.port == 5002) && tcp.flags.syn == 1` để tìm kết nối. Chọn một packet, dùng **Analyze → Follow → TCP Stream**, rồi dùng filter theo stream mà Wireshark tạo để xem cả TCP SYN, SYN-ACK và ACK cuối, kể cả packet không có cờ SYN. Chú ý client dùng source port tạm. [Following protocol streams](https://www.wireshark.org/docs/wsug_html_chunked/ChAdvFollowStreamSection.html)
+4. Trong stream chat, tìm `HELLO|<name>|<port>|CHAT|` và `MSG|<length>|<UTF-8 bytes>`. Kiểm tra length theo byte UTF-8 của nội dung. Một frame có thể trải qua nhiều packet. Trong stream file riêng, tìm `HELLO|<name>|<port>|FILE|`, `FILE|<filename>|<size>|`, payload và `FILE_ACK|1|OK|` theo chiều ngược lại. `FILE_ACK` là dữ liệu ứng dụng trong TCP payload.
+5. Ghi số frame cho handshake, số stream cho chat và file, và SHA-256 hai đầu. Nếu xem trên loopback, chọn interface loopback và dùng port thực tế của lần chạy. Capture trên loopback không đại diện cho broadcast trên Ethernet hoặc Wi-Fi.
+
+### Ma trận xác minh Phase 3
+
+| Yêu cầu | Trạng thái | Bằng chứng hoặc giới hạn |
+|---|---|---|
+| A · P2P console, UDP discovery, TCP chat và file | PASS | Ba process trên IPv4 loopback và hai instance Kitty trên cùng máy. |
+| B · Discovery, online/away và peer expiry | PASS | Đã xác nhận trong integration và thử thủ công trên cùng máy. UDP discovery dùng cổng 9999 khi chạy app trực tiếp. |
+| C · Chat hai chiều, simultaneous dial, đa peer, unread và `/leave` | PASS | Integration buộc simultaneous dial và đối chiếu TCP stream. Thử thủ công xác nhận chat UTF-8 hai chiều, unread và giữ TCP sau `/leave`. |
+| D · File, progress, chat đồng thời, hủy và dọn file | PASS | Thử thủ công với file 16 MiB xác nhận progress 100%, `FILE_ACK` và SHA-256. Integration giữ upload đang chạy để kiểm tra chat đồng thời và hủy bằng `/quit`. |
+| E · ANSI output, draft và cursor | PASS | Regression chạy qua POSIX PTY. |
+| E · Render và thao tác trực tiếp trên Kitty | PASS | Thử thủ công trên Arch Linux/Hyprland xác nhận draft, cursor và thông báo unread khi có output xen vào. |
+| F · Wire protocol, UTF-8 và FILE_ACK | PASS | Regression và integration kiểm tra framing hợp lệ, header bị từ chối, ACK thành công và lỗi quota. |
+| G · Reconnect, disconnect, quota và shutdown | PASS | Người kiểm thử xác nhận reconnect, disconnect, expiry và history sau `/quit`. Integration kiểm tra thêm từ chối trước payload khi vượt quota. |
+| H · README, hướng dẫn thử nghiệm và hướng dẫn capture | PASS | Các bước và tiêu chí ghi kết quả nằm trong mục này. |
+| H · Capture Wireshark thật | UNVERIFIED | Chưa có capture cho UDP discovery, TCP handshake và các stream chat/file. |
+| H · Báo cáo 5–10 trang | UNVERIFIED | Tài liệu nộp riêng ngoài phạm vi xác minh Phase 3 này. |
+| I · Multi-instance trên cùng máy | PASS | Ba process loopback và hai cửa sổ Kitty đã chạy thành công. |
+| I · Demo hai máy vật lý trên LAN | UNVERIFIED | Chờ đồng đội có máy thứ hai. |
+
+Các quyết định còn mở gồm quota khi nhiều process dùng chung `--data-dir`, giới hạn tổng byte của hàng đợi chat và chính sách giữ history trong RAM. Hành vi firewall, broadcast qua Wi-Fi và hard link trên filesystem khác cần được đánh giá trong môi trường triển khai.
 
 ---
 

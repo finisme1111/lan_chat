@@ -304,3 +304,22 @@ class ChatConnectionsTest(unittest.TestCase):
             dial.assert_called_once_with(self.peer_key)
         self.assertIsNone(self.state.current_partner)
         replacement.close.assert_not_called()
+
+    def test_winning_incoming_restores_selection_after_losing_socket_closes(self):
+        outgoing = self.make_socket(61000, 5002)
+        incoming = self.make_socket(5001, 61001)
+        self.connect_chat(self.peer_key, outgoing)
+        self.state.current_partner = self.peer_key
+        self.state.reconnect_partner = self.peer_key
+        tcp._cleanup_connection(self.peer_key, outgoing)
+        self.assertIsNone(self.state.current_partner)
+
+        self.accept_chat(incoming, 5002)
+        self.assertEqual(self.state.current_partner, self.peer_key)
+        self.assertIs(tcp.get_or_connect(self.peer_key), incoming)
+
+    def test_incoming_connection_after_leave_does_not_restore_selection(self):
+        incoming = self.make_socket(5001, 61001)
+        self.accept_chat(incoming, 5002)
+        self.assertIsNone(self.state.current_partner)
+        self.assertIs(tcp.get_or_connect(self.peer_key), incoming)
