@@ -63,6 +63,9 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 65536
 CHAT_CONNECT_TIMEOUT = 5.0
 CHAT_WRITE_TIMEOUT = 10.0
+CHAT_HEADER_TIMEOUT = 10.0
+CHAT_PAYLOAD_IDLE_TIMEOUT = 10.0
+CHAT_PAYLOAD_TOTAL_TIMEOUT = 60.0
 FILE_IO_TIMEOUT = 10.0
 HANDSHAKE_TIMEOUT = 10.0
 MAX_INCOMING_WORKERS = 32
@@ -89,24 +92,11 @@ _CONNECT_IN_PROGRESS = {
 # Các hàm đọc dữ liệu Socket mức thấp có bảo vệ (Low-level Helpers)
 # ---------------------------------------------------------------------------
 
-def _recv_field(sock: socket.socket, deadline: Optional[float] = None) -> str:
-    """
-    Đọc từng byte cho đến khi gặp ký tự phân tách '|'.
-    Chống DoS: Nếu đọc quá MAX_FIELD_LEN (4KB) mà chưa thấy '|', ném ValueError.
-    Bắt lỗi ngắt kết nối và chuyển thành ConnectionResetError.
-    """
+def _read_field(recv: Callable[[int], bytes]) -> str:
+    """Read one UTF-8 field without consuming any bytes of the next field."""
     buf = bytearray()
     while True:
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Hết thời gian đọc header TCP.")
-            sock.settimeout(remaining)
-        try:
-            ch = sock.recv(1)
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
-            raise ConnectionResetError(f"Lỗi kết nối khi đọc trường dữ liệu: {e}")
-
+        ch = recv(1)
         if not ch:
             raise ConnectionResetError("Đối tác đã đóng kết nối đột ngột.")
 
@@ -121,21 +111,65 @@ def _recv_field(sock: socket.socket, deadline: Optional[float] = None) -> str:
             raise ValueError(f"Độ dài trường header vượt quá giới hạn an toàn ({MAX_FIELD_LEN} bytes).")
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    """
-    Đọc chính xác n bytes từ socket bằng vòng lặp.
-    Đảm bảo không bị thiếu hụt dữ liệu do phân mảnh gói tin TCP (TCP chunking).
-    """
+def _recv_field(sock: socket.socket, deadline: float) -> str:
+    """Read a field during handshake or FILE_ACK, before sharing the socket."""
+    def recv(size: int) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Hết thời gian đọc header TCP.")
+        sock.settimeout(remaining)
+        return sock.recv(size)
+
+    return _read_field(recv)
+
+
+def _recv_chat_before(sock: socket.socket, size: int, deadline: float) -> bytes:
+    # CHAT has one reader and a concurrent writer. Keep the socket mode unchanged.
+    remaining = deadline - time.monotonic()
+    if remaining > 0 and select.select([sock], [], [], remaining)[0]:
+        chunk = sock.recv(size)
+        if time.monotonic() < deadline:
+            return chunk
+    raise TimeoutError("Hết thời gian nhận frame CHAT.")
+
+
+def _recv_chat_header(sock: socket.socket) -> tuple[str, int]:
+    deadline = None
+
+    def recv(size: int) -> bytes:
+        nonlocal deadline
+        if deadline is None:
+            # An established connection can stay idle between frames.
+            first_byte = sock.recv(size)
+            deadline = time.monotonic() + CHAT_HEADER_TIMEOUT
+            return first_byte
+        return _recv_chat_before(sock, size, deadline)
+
+    msg_type = _read_field(recv)
+    if msg_type != MSG_TYPE_MSG:
+        return msg_type, 0
+
+    length_str = _read_field(recv)
+    try:
+        length = int(length_str)
+        if not 0 <= length <= MAX_MSG_LEN:
+            raise ValueError(f"Độ dài tin nhắn không hợp lệ: {length}")
+    except ValueError as e:
+        raise ValueError(f"Header MSG sai cú pháp: {e}") from e
+    return msg_type, length
+
+
+def _recv_chat_payload(sock: socket.socket, n: int) -> bytes:
+    started = time.monotonic()
+    total_deadline = started + CHAT_PAYLOAD_TOTAL_TIMEOUT
+    idle_deadline = started + CHAT_PAYLOAD_IDLE_TIMEOUT
     buf = bytearray()
     while len(buf) < n:
-        try:
-            chunk = sock.recv(min(n - len(buf), CHUNK_SIZE))
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
-            raise ConnectionResetError(f"Lỗi kết nối khi đọc dữ liệu payload: {e}")
-
+        chunk = _recv_chat_before(sock, min(n - len(buf), CHUNK_SIZE), min(total_deadline, idle_deadline))
         if not chunk:
             raise ConnectionResetError(f"Kết nối bị đứt: mong đợi {n} bytes nhưng chỉ nhận được {len(buf)} bytes.")
         buf += chunk
+        idle_deadline = time.monotonic() + CHAT_PAYLOAD_IDLE_TIMEOUT
     return bytes(buf)
 
 
@@ -449,20 +483,10 @@ def _receiver_loop(sock: socket.socket, peer_key: str, peer_name_hint: str = "")
     notice = None
     try:
         while not state.stop_event.is_set():
-            # 1. Đọc loại frame
-            msg_type = _recv_field(sock)
+            msg_type, length = _recv_chat_header(sock)
 
             if msg_type == MSG_TYPE_MSG:
-                # Format: MSG|<length>|<content>
-                length_str = _recv_field(sock)
-                try:
-                    length = int(length_str)
-                    if length < 0 or length > MAX_MSG_LEN:
-                        raise ValueError(f"Độ dài tin nhắn không hợp lệ: {length}")
-                except ValueError as e:
-                    raise ValueError(f"Header MSG sai cú pháp: {e}")
-
-                content_bytes = _recv_exact(sock, length)
+                content_bytes = _recv_chat_payload(sock, length)
                 content = content_bytes.decode("utf-8", errors="replace")
 
                 timestamp = time.strftime("%H:%M:%S")

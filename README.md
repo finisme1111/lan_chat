@@ -211,9 +211,15 @@ Dùng `↑` `↓` để duyệt lịch sử lệnh đã gõ.
 
 Mỗi instance gửi một file tại một thời điểm, tối đa 2 GiB mỗi file. Receiver lưu vào `downloads/` trong data directory và dùng hard link để publish cùng filesystem. Nếu peer đóng connection khi chưa gửi ACK được hỗ trợ, sender báo chưa xác nhận lưu file.
 
-Quota tính file thường hiện có trực tiếp trong `downloads/` và kích thước đã đặt trước cho các lượt nhận cùng instance. Khi vượt quota hoặc thiếu dung lượng trống, ứng dụng từ chối lượt nhận mới. Dùng `--data-dir` riêng cho từng instance để mỗi instance quản lý reservation riêng.
+Quota tính file thường hiện có trực tiếp trong `downloads/` và kích thước đã đặt trước cho các lượt nhận cùng instance. Khi vượt quota hoặc thiếu dung lượng trống, ứng dụng từ chối lượt nhận mới.
+
+Mỗi `--data-dir` sau khi resolve chỉ dành cho một instance tại một thời điểm. Dùng thư mục riêng để chạy nhiều instance. Ứng dụng khóa file `.lan-chat.lock` trước khi đọc history hoặc khởi tạo mạng, và báo lỗi nếu thư mục đang được dùng hoặc hệ điều hành không cấp được lock. OS giải phóng lock khi process kết thúc, kể cả khi process bị dừng cưỡng bức. File lock vẫn nằm trong thư mục để các lần chạy luôn khóa cùng một file. Đừng xóa hoặc thay thế file lock khi ứng dụng đang chạy.
+
+Lock đã được kiểm tra trên Arch Linux. macOS dùng `flock` như Linux. Windows dùng `msvcrt.locking`. Runtime trên macOS và Windows chưa được xác minh. Dùng filesystem cục bộ có hỗ trợ khóa của OS. Các bản cũ chưa có lock vẫn có thể truy cập cùng thư mục, vì vậy hãy dùng data directory riêng khi chạy song song với bản cũ.
 
 TCP chat có deadline ghi 10 giây cho mỗi frame. Queue chat có tối đa 64 lệnh chờ và ngân sách payload 32 MiB. Queue `/broadcast` có tối đa 8 lệnh chờ và ngân sách riêng 16 MiB. Ngân sách tính byte UTF-8 của tin nhắn đang chờ và đang xử lý, gồm prefix `[Broadcast]`. Mỗi tin vẫn giới hạn 10 MiB. Khi một queue đầy, ứng dụng từ chối lệnh mới và báo để người dùng thử lại. RAM thực tế còn gồm history, socket buffer và overhead của Python.
+
+Kết nối CHAT có thể chờ giữa hai frame. Từ byte đầu tiên, receiver có 10 giây để nhận đủ header. Khi đọc payload, receiver chờ tối đa 10 giây giữa hai lượt đọc có tiến triển và tối đa 60 giây cho toàn bộ payload. Vượt một trong các ngưỡng này sẽ đóng kết nối đang nhận và bỏ frame dở trước khi cập nhật history hoặc unread. Wire format và định dạng `chat_history.json` được giữ nguyên.
 
 Khi thoát, ứng dụng báo số lệnh chưa chạy bị hủy và chờ tối đa 2 giây cho lần lưu history cuối. `/history` chụp phần tin cần hiển thị, gồm cả tin chưa đọc nằm trước cửa sổ 20 tin gần nhất. Định dạng `chat_history.json` và chính sách giữ history được giữ nguyên.
 
@@ -226,7 +232,7 @@ python3 -B run_auto_test.py
 
 Regression tests bao gồm socket ownership, framing, timeout, storage, command parsing và redraw qua pipe input và POSIX PTY. PTY test kiểm tra ANSI output, draft, cursor và thông báo unread.
 
-Integration harness chạy ba subprocess trên IPv4 loopback với cổng động và data directory tạm riêng. Subprocess nhận lệnh từng dòng để kiểm tra CLI và network; regression PTY kiểm tra phần render. Harness dùng gate để buộc hai peer cùng dial trước khi gửi HELLO và giữ upload sau chunk đầu tiên trong khi kiểm tra chat. Fault injection chỉ hoạt động trong test subprocess. Script trả exit code khác 0 khi có lỗi.
+Integration harness chạy ba subprocess trên IPv4 loopback với cổng động và data directory tạm riêng. Subprocess nhận lệnh từng dòng để kiểm tra CLI và network; regression PTY kiểm tra phần render. Harness dùng gate để buộc hai peer cùng dial trước khi gửi HELLO và giữ upload sau chunk đầu tiên trong khi kiểm tra chat. Một scenario TCP loopback kiểm tra receiver đóng kết nối khi payload CHAT ngừng tiến triển trong khi CLI vẫn phản hồi. Fault injection chỉ hoạt động trong test subprocess. Script trả exit code khác 0 khi có lỗi.
 
 ### Kiểm tra thủ công trên hai máy cùng LAN
 
@@ -298,7 +304,7 @@ Chạy hai lệnh trên từ Kitty để kiểm tra redraw trực tiếp. Có th
 | I · Multi-instance trên cùng máy | PASS | Ba process loopback và hai cửa sổ Kitty đã chạy thành công. |
 | I · Demo hai máy vật lý trên LAN | UNVERIFIED | Chờ đồng đội có máy thứ hai. |
 
-Các quyết định còn mở gồm quota khi nhiều process dùng chung `--data-dir` và chính sách giữ history trong RAM. Hành vi firewall, broadcast qua Wi-Fi và hard link trên filesystem khác cần được đánh giá trong môi trường triển khai.
+Chính sách giữ history trong RAM vẫn là quyết định còn mở. Hành vi firewall, broadcast qua Wi-Fi và hard link trên filesystem khác cần được đánh giá trong môi trường triển khai.
 
 ---
 
@@ -312,6 +318,7 @@ lan_chat/
 ├── udp_handler.py     # UDP Discovery (broadcast + listener)
 ├── tcp_handler.py     # TCP chat engine (acceptor, receiver, file)
 ├── history.py         # Lưu/đọc lịch sử JSON, autosave
+├── data_dir_lock.py   # Khóa data directory trong vòng đời process
 ├── ui_handler.py      # prompt_toolkit UI, Tab Autocomplete
 ├── requirements.txt   # prompt_toolkit>=3.0.0
 │

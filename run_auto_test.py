@@ -442,6 +442,19 @@ def run_tests():
             minh.send("/help")
             minh.expect("Lệnh Discovery", start=start)
 
+        def stalled_chat_frame():
+            start = minh.checkpoint()
+            with socket.create_connection(("127.0.0.1", minh.port), timeout=3) as conn:
+                port = conn.getsockname()[1]
+                conn.sendall(f"HELLO|QA-stall|{port}|CHAT|MSG|4|a".encode("ascii"))
+                minh.expect("QA-stall đã kết nối vào trò chuyện", start=start)
+                minh.send("/help")
+                minh.expect("Lệnh Discovery", start=start)
+                conn.settimeout(15)
+                if conn.recv(1) != b"":
+                    raise AssertionError("Receiver chưa đóng socket khi payload CHAT bị kẹt")
+                minh.expect("Kết nối với QA-stall đã bị ngắt", start=start)
+
         def disconnect():
             start = minh.checkpoint()
             quan.proc.terminate()
@@ -466,6 +479,7 @@ def run_tests():
             ("Truyền file, ACK và SHA-256", file_transfer),
             ("Quota downloads từ chối trước payload", quota),
             ("Từ chối header không hợp lệ", invalid_header),
+            ("Timeout payload CHAT trên TCP loopback", stalled_chat_frame),
             ("Hủy upload bằng /quit và dọn file tạm", cancel_upload),
             ("Tự reconnect khi UDP presence còn hoạt động", reconnect),
             ("Peer timeout và danh sách sau expiry", expire_peer),

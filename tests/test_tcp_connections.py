@@ -2,6 +2,7 @@ import errno
 import socket
 import threading
 import unittest
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
@@ -38,6 +39,141 @@ class ChatConnectionsTest(unittest.TestCase):
     def connect_chat(self, peer_key, outgoing):
         with patch.object(tcp.socket, "socket", return_value=outgoing), patch.object(tcp.threading, "Thread"):
             return tcp.get_or_connect(peer_key)
+
+    def receive_scheduled(self, arrivals):
+        """Drive CHAT reads with arrival times on a fake monotonic clock."""
+        pending = deque(arrivals)
+        now = 0.0
+        conn = self.make_socket(5001, 61000)
+        self.state.connections[self.peer_key] = tcp.ChatConnection(conn, outgoing=False)
+
+        def recv(size):
+            nonlocal now
+            arrival, chunk = pending.popleft()
+            now = max(now, arrival)
+            self.assertLessEqual(len(chunk), size)
+            return chunk
+
+        def select_read(readers, writers, errors, timeout):
+            nonlocal now
+            self.assertEqual((readers, writers, errors), ([conn], [], []))
+            if pending and pending[0][0] < now + timeout:
+                now = max(now, pending[0][0])
+                return readers, [], []
+            now += timeout
+            return [], [], []
+
+        conn.recv.side_effect = recv
+        with (
+            patch.object(tcp.time, "monotonic", side_effect=lambda: now),
+            patch.object(tcp.select, "select", side_effect=select_read),
+            patch.object(tcp, "_msg_cb") as message,
+        ):
+            tcp._receiver_loop(conn, self.peer_key, "B")
+        conn.settimeout.assert_not_called()
+        conn.close.assert_called_once()
+        self.assertNotIn(self.peer_key, self.state.connections)
+        return now, message
+
+    @staticmethod
+    def header_at(start, header):
+        return [(start, bytes([byte])) for byte in header]
+
+    def assert_receive_preserves_history(self, arrivals, deadline):
+        self.state.chat_history[self.peer_key] = ["previous unread message"]
+        self.state.unread_counts[self.peer_key] = 1
+        self.state.first_unread[self.peer_key] = 0
+        elapsed, message = self.receive_scheduled(arrivals)
+        self.assertEqual(elapsed, deadline)
+        message.assert_not_called()
+        self.assertEqual(self.state.chat_history[self.peer_key], ["previous unread message"])
+        self.assertEqual(self.state.unread_counts[self.peer_key], 1)
+        self.assertEqual(self.state.first_unread[self.peer_key], 0)
+
+    def test_partial_frame_type_expires_from_first_byte_after_idle(self):
+        self.assert_receive_preserves_history([(100, b"M"), (111, b"S")], 110)
+
+    def test_partial_length_shares_the_frame_type_deadline(self):
+        self.assert_receive_preserves_history([(0, b"M"), *self.header_at(8, b"SG|1"), (11, b"|")], 10)
+
+    def test_payload_inactivity_deadline_resets_on_progress(self):
+        arrivals = [*self.header_at(0, b"MSG|2|"), (9, b"a"), (20, b"b")]
+        self.assert_receive_preserves_history(arrivals, 19)
+
+    def test_payload_total_deadline_expires_despite_regular_progress(self):
+        arrivals = self.header_at(0, b"MSG|7|") + [(t, b"a") for t in range(9, 64, 9)]
+        self.assert_receive_preserves_history(arrivals, 60)
+
+    def test_slow_fragmented_utf8_and_back_to_back_frames_are_received(self):
+        now, message = self.receive_scheduled([
+            (80, b"M"), *self.header_at(89, b"SG|2|"), (98, b"\xc3"), (107, b"\xa9"),
+            *self.header_at(107, b"MSG|1|"), (107, b"x"), *self.header_at(107, b"BYE|"),
+        ])
+        self.assertEqual(now, 107)
+        self.assertEqual([call.args[2] for call in message.call_args_list], ["é", "x"])
+        self.assertEqual(self.state.unread_counts[self.peer_key], 2)
+
+    def test_eof_discards_partial_frame_without_waiting_for_deadline(self):
+        for header in (b"MS", b"MSG|2|a"):
+            with self.subTest(header=header):
+                self.assert_receive_preserves_history([*self.header_at(0, header), (2, b"")], 2)
+
+    def test_stalled_reader_releases_inbound_slot_and_allows_reconnect(self):
+        waiting, sender = socket.socketpair()
+        replacement, replacement_peer = socket.socketpair()
+        with (
+            waiting, sender, replacement, replacement_peer,
+            patch.object(tcp, "CHAT_HEADER_TIMEOUT", 0.1),
+            patch.object(tcp, "MAX_INCOMING_WORKERS", 1),
+        ):
+            self.state.current_partner = self.peer_key
+            self.state.reconnect_partner = self.peer_key
+            self.state.connections[self.peer_key] = tcp.ChatConnection(waiting, outgoing=False)
+            self.assertTrue(tcp._start_tcp_worker(waiting, tcp._receiver_loop, (self.peer_key,), incoming=True))
+            worker, _ = self.state.tcp_workers[waiting]
+            sender.sendall(b"MSG|")
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(waiting.fileno(), -1)
+            self.assertNotIn(waiting, self.state.tcp_workers)
+            self.assertIsNone(self.state.current_partner)
+
+            def connect(peer_key):
+                self.state.connections[peer_key] = tcp.ChatConnection(replacement, outgoing=True)
+                return replacement
+
+            with patch.object(tcp, "get_or_connect", side_effect=connect) as dial:
+                tcp._reconnect_selected_peer()
+            dial.assert_called_once_with(self.peer_key)
+            self.assertEqual(self.state.current_partner, self.peer_key)
+            self.assertTrue(tcp._start_tcp_worker(replacement, tcp._receiver_loop, (self.peer_key,), incoming=True))
+            replacement_peer.sendall(b"BYE|")
+            self.assertTrue(tcp.drain_tcp_workers())
+
+    def test_shutdown_wakes_receiver_waiting_for_partial_payload(self):
+        conn, sender = socket.socketpair()
+        waiting = threading.Event()
+        select_read = tcp.select.select
+
+        def ready(readers, writers, errors, timeout):
+            result = select_read(readers, writers, errors, 0)
+            if not result[0]:
+                waiting.set()
+                return select_read(readers, writers, errors, timeout)
+            return result
+
+        with conn, sender, patch.object(tcp.select, "select", side_effect=ready):
+            sender.sendall(b"MSG|2|a")
+            self.state.connections[self.peer_key] = tcp.ChatConnection(conn, outgoing=False)
+            self.assertTrue(tcp._start_tcp_worker(conn, tcp._receiver_loop, (self.peer_key,), incoming=True))
+            try:
+                self.assertTrue(waiting.wait(2))
+            finally:
+                self.state.stop_event.set()
+                self.assertTrue(tcp.drain_tcp_workers(timeout=2))
+        self.assertFalse(self.state.chat_history.get(self.peer_key))
+        self.assertFalse(self.state.unread_counts.get(self.peer_key))
+        self.assertFalse(self.state.tcp_workers)
 
     def test_retired_receiver_does_not_close_replacement(self):
         original = self.make_socket(5001, 61000)

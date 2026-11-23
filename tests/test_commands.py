@@ -92,7 +92,11 @@ class CommandsTest(unittest.TestCase):
     def test_outgoing_history_does_not_hide_older_unread_message(self):
         conn = Mock()
         conn.recv.return_value = b"unread"
-        with patch.object(tcp, "state", self.state), patch.object(tcp, "_recv_field", side_effect=["MSG", "6", "BYE"]):
+        with (
+            patch.object(tcp, "state", self.state),
+            patch.object(tcp, "_recv_chat_header", side_effect=[("MSG", 6), ("BYE", 0)]),
+            patch.object(tcp.select, "select", return_value=([conn], [], [])),
+        ):
             tcp._receiver_loop(conn, self.peer_key, "B")
         self.state.chat_history[self.peer_key].extend(["outgoing"] * 30)
         with patch.object(ui, "state", self.state), patch.object(ui, "_print_fragments") as output:

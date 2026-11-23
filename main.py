@@ -23,6 +23,7 @@ from typing import Callable
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from data_dir_lock import lock_data_directory
 from history import load_history, start_autosave_thread
 from models import DEFAULT_DOWNLOAD_QUOTA_GIB, GIB, Peer, state
 from protocol import MAX_MSG_LEN, UDP_PORT, normalize_peer_name
@@ -562,6 +563,11 @@ def main():
         state.data_dir.mkdir(parents=True, exist_ok=True)
     except (OSError, RuntimeError) as e:
         parser.error(f"Không thể mở --data-dir: {e}")
+
+    try:
+        lock_data_directory(state.data_dir)
+    except OSError as e:
+        parser.error(f"Không thể khóa --data-dir '{state.data_dir}'. {e}")
 
     # 1. Khởi tạo trạng thái danh tính cá nhân
     state.my_name = normalize_peer_name(args.name)
