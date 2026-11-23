@@ -14,13 +14,12 @@ Tại sao dùng prompt_toolkit thay vì input() thông thường?
 - `PromptSession` cung cấp lịch sử gõ (↑↓), autocomplete, và nhiều tính năng khác.
 """
 
-import html as html_lib
+import threading
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion, PathCompleter
 from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
 from prompt_toolkit.shortcuts import print_formatted_text
 
@@ -49,46 +48,48 @@ APP_STYLE = Style.from_dict({
 })
 
 
-# ---------------------------------------------------------------------------
-# Hàm tiện ích in có màu (thread-safe với patch_stdout)
-# ---------------------------------------------------------------------------
-# Tất cả hàm dưới đây dùng html_lib.escape() cho dữ liệu user-provided
-# vì HTML() của prompt_toolkit dùng XML parser nghiêm ngặt:
-# & → &amp;  |  < → &lt;  |  > → &gt;
+_output_lock = threading.Lock()
+_display_controls = dict.fromkeys(
+    (code for code in (*range(32), *range(127, 160)) if code not in (9, 10)),
+    "\uFFFD",
+)
+
+
+def _display_text(text: str) -> str:
+    return text.translate(_display_controls)
+
+
+def _print_fragments(*fragments):
+    with _output_lock:
+        print_formatted_text(FormattedText(fragments), style=APP_STYLE)
+
+
+def _print_notice(style: str, label: str, message: str):
+    _print_fragments((f"class:{style}", label), ("", " " + _display_text(message)))
 
 def print_info(msg: str):
     """In thông báo hệ thống màu cyan."""
-    print_formatted_text(
-        HTML(f"<info>[INFO]</info> {html_lib.escape(msg)}"), style=APP_STYLE
-    )
+    _print_notice("info", "[INFO]", msg)
 
 
 def print_success(msg: str):
     """In thông báo thành công màu xanh."""
-    print_formatted_text(
-        HTML(f"<success>[OK]</success>  {html_lib.escape(msg)}"), style=APP_STYLE
-    )
+    _print_notice("success", "[OK]", msg)
 
 
 def print_warning(msg: str):
     """In cảnh báo màu vàng."""
-    print_formatted_text(
-        HTML(f"<warning>[WARN]</warning> {html_lib.escape(msg)}"), style=APP_STYLE
-    )
+    _print_notice("warning", "[WARN]", msg)
 
 
 def print_error(msg: str):
     """In thông báo lỗi màu đỏ."""
-    print_formatted_text(
-        HTML(f"<error>[ERR]</error>  {html_lib.escape(msg)}"), style=APP_STYLE
-    )
+    _print_notice("error", "[ERR]", msg)
 
 
 def print_system(msg: str):
     """In thông báo hệ thống (peer join/leave/file) màu tím."""
-    print_formatted_text(
-        HTML(f"<system>*** {html_lib.escape(msg)} ***</system>"), style=APP_STYLE
-    )
+    _print_fragments(("class:system", f"*** {_display_text(msg)} ***"))
 
 
 def print_chat(sender: str, msg: str, is_self: bool = False):
@@ -97,11 +98,10 @@ def print_chat(sender: str, msg: str, is_self: bool = False):
     is_self=True → màu xanh lá (tin của mình).
     is_self=False → màu xanh dương (tin của peer).
     """
-    safe_sender = html_lib.escape(sender)
-    safe_msg = html_lib.escape(msg)
     tag = "self" if is_self else "peer"
-    print_formatted_text(
-        HTML(f"<{tag}>[{safe_sender}]</{tag}> {safe_msg}"), style=APP_STYLE
+    _print_fragments(
+        (f"class:{tag}", f"[{_display_text(sender)}]"),
+        ("", f" {_display_text(msg)}"),
     )
 
 
@@ -119,14 +119,14 @@ BANNER = r"""
 HELP_TEXT = """
 ┌─ Lệnh Discovery ──────────────────────────────────────┐
 │  /list              Hiển thị danh sách peer online     │
-│  /status <s>        Đổi trạng thái (available|busy)    │
+│  /status <s>        Đổi trạng thái (online|away)       │
 ├─ Lệnh Chat ───────────────────────────────────────────┤
-│  /chat <tên>        Bắt đầu chat với peer              │
-│  /send <tin nhắn>   Gửi tin nhắn đến peer hiện tại    │
+│  /chat <tên|số>     Bắt đầu chat với peer              │
+│  Nhập nội dung      Gửi tin nhắn đến peer hiện tại    │
 │  /history           Xem lại lịch sử chat               │
 │  /leave             Rời chat (giữ kết nối TCP)         │
 ├─ Lệnh File ───────────────────────────────────────────┤
-│  /file <đường dẫn>  Gửi file đến peer hiện tại        │
+│  /send <tệp>        Gửi file (/file là alias)          │
 ├─ Chung ───────────────────────────────────────────────┤
 │  /help              Hiển thị trợ giúp này              │
 │  /quit              Thoát chương trình                 │
@@ -135,42 +135,32 @@ HELP_TEXT = """
 
 
 def print_banner():
-    """
-    In banner khởi động.
-    html_lib.escape() chuyển ký tự đặc biệt trong ASCII art thành HTML entities,
-    tránh ExpatError khi HTML() parse chuỗi có &, <, >.
-    """
-    safe_banner = html_lib.escape(BANNER)
-    print_formatted_text(HTML(f"<success>{safe_banner}</success>"), style=APP_STYLE)
+    _print_fragments(("class:success", BANNER))
 
 
 def print_help():
     """In hướng dẫn sử dụng."""
-    print_formatted_text(HELP_TEXT)
+    _print_fragments(("", HELP_TEXT))
 
 
 # ---------------------------------------------------------------------------
 # Hiển thị danh sách Peer
 # ---------------------------------------------------------------------------
 
-def display_peer_list():
+def display_peer_list(peers):
     """
     In danh sách tất cả peer đang online.
-    Lấy snapshot từ state (thread-safe) rồi in ra.
+    Dùng cùng snapshot với chỉ số mà lệnh /chat sẽ tra cứu.
     """
-    peers = state.get_peer_list_snapshot()
     if not peers:
         print_warning("Không có peer nào online. Đang chờ discovery...")
         return
 
-    print_formatted_text(
-        HTML(f"\n<info>── Danh sách Peer Online ({len(peers)} người) ──</info>"),
-        style=APP_STYLE,
-    )
-    for i, peer in enumerate(peers, 1):
-        key = state.get_peer_key(peer.ip, peer.tcp_port)
+    _print_fragments(("class:info", f"\n── Danh sách Peer Online ({len(peers)} người) ──"))
+    for i, (key, peer) in enumerate(peers.items(), 1):
         with state.lock:
             unread = state.unread_counts.get(key, 0)
+        with state.conn_lock:
             is_connected = key in state.connections
 
         # Hiển thị badge: kết nối TCP đang mở và tin chưa đọc
@@ -182,16 +172,13 @@ def display_peer_list():
         badge_str = f"  [{', '.join(badges)}]" if badges else ""
 
         status_icon = "🟢" if peer.status == "available" else ("🟡" if peer.status == "away" else "🔴")
-        print_formatted_text(
-            HTML(
-                f"  <b>{i}.</b> <peer>{html_lib.escape(peer.name)}</peer>"
-                f" ({peer.ip}:{peer.tcp_port})"
-                f" {status_icon} {peer.status}"
-                f"{html_lib.escape(badge_str)}"
-            ),
-            style=APP_STYLE,
+        status = "online" if peer.status == "available" else peer.status
+        _print_fragments(
+            ("bold", f"  {i}. "),
+            ("class:peer", _display_text(peer.name)),
+            ("", f" ({peer.ip}:{peer.tcp_port}) {status_icon} {status}{badge_str}"),
         )
-    print_formatted_text("")
+    _print_fragments(("", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -204,36 +191,39 @@ def display_chat_history(peer_key: str, last_n: int = 20):
 
     Tham số:
         peer_key: "ip:port" của peer.
-        last_n:   Chỉ hiển thị N tin nhắn gần nhất (tránh scroll quá nhiều).
+        last_n:   Số tin gần nhất cần hiển thị, mở rộng khi còn nhiều tin chưa đọc.
     """
     with state.lock:
         history = list(state.chat_history.get(peer_key, []))
         peer_name = peer_key  # fallback
         if peer_key in state.peer_list:
             peer_name = state.peer_list[peer_key].name
-        state.unread_counts[peer_key] = 0   # Đánh dấu đã đọc
+        unread = state.unread_counts.get(peer_key, 0)
+        first_unread = state.first_unread.get(peer_key, len(history) - unread)
 
     if not history:
         print_info(f"Chưa có tin nhắn với {peer_name}.")
         return
 
-    shown = history[-last_n:]
+    start = max(0, min(len(history) - last_n, first_unread))
+    shown = history[start:]
     omitted = len(history) - len(shown)
-    safe_name = html_lib.escape(peer_name)
-
-    print_formatted_text(
-        HTML(f"\n<info>── Lịch sử chat với {safe_name} (hiển thị {len(shown)}/{len(history)}) ──</info>"),
-        style=APP_STYLE,
+    _print_fragments(
+        ("class:info", f"\n── Lịch sử chat với {_display_text(peer_name)} ({len(shown)}/{len(history)}) ──"),
     )
     if omitted > 0:
-        print_formatted_text(
-            HTML(f"<history>  ... {omitted} tin nhắn cũ hơn ...</history>"),
-            style=APP_STYLE,
-        )
+        _print_fragments(("class:history", f"  ... {omitted} tin nhắn cũ hơn ..."))
     for entry in shown:
         # entry là plain text đã format sẵn: "[HH:MM:SS] Name: content"
-        print_formatted_text(html_lib.escape(entry))
-    print_formatted_text("")
+        _print_fragments(("", _display_text(entry)))
+    _print_fragments(("", ""))
+    with state.lock:
+        remaining = max(0, state.unread_counts.get(peer_key, 0) - unread)
+        state.unread_counts[peer_key] = remaining
+        if remaining and unread:
+            state.first_unread[peer_key] = len(history)
+        elif not remaining:
+            state.first_unread.pop(peer_key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +252,8 @@ class LanChatCompleter(Completer):
       Gõ '/'          → gợi ý tên lệnh
       '/chat M'       → gợi ý tên peer bắt đầu bằng 'M'
       '/broadcast '   → gợi ý tên tất cả peer
-      '/status '      → gợi ý 'available' / 'busy'
-      '/file ./'      → gợi ý đường dẫn file (PathCompleter)
+      '/status '      → gợi ý 'online' / 'away'
+      '/send ./'      → gợi ý đường dẫn file (PathCompleter)
     """
 
     def __init__(self):
@@ -298,24 +288,24 @@ class LanChatCompleter(Completer):
         # /chat <tên_peer> và /broadcast <tên_peer>
         if cmd in ("/chat", "/broadcast"):
             peers = state.get_peer_list_snapshot()
-            for peer in peers:
+            for peer in peers.values():
                 if peer.name.lower().startswith(arg.lower()):
                     # Thay thế phần đã gõ của tên peer
                     yield Completion(
                         peer.name,
                         start_position=-len(arg),
-                        display=peer.name,
+                        display=_display_text(peer.name),
                         display_meta=f"{peer.ip}:{peer.tcp_port} [{peer.status}]",
                     )
 
         # /status <trạng thái>
         elif cmd == "/status":
-            for s in ("available", "busy", "away"):
+            for s in ("online", "away"):
                 if s.startswith(arg):
                     yield Completion(s, start_position=-len(arg))
 
         # /file <đường_dẫn> — delegate cho PathCompleter
-        elif cmd == "/file":
+        elif cmd in ("/send", "/file"):
             # Tạo sub-document chỉ chứa phần đường dẫn
             import prompt_toolkit.document as _doc
             sub = _doc.Document(arg, cursor_position=len(arg))
@@ -348,7 +338,7 @@ def get_prompt_text() -> str:
     """
     with state.lock:
         name = state.my_name
-        status = state.my_status
+        status = "online" if state.my_status == "available" else state.my_status
         partner_key = state.current_partner
 
     if partner_key:
@@ -356,5 +346,5 @@ def get_prompt_text() -> str:
         with state.lock:
             if partner_key in state.peer_list:
                 peer_name = state.peer_list[partner_key].name
-        return f"[{name}|{status} → {peer_name}]> "
-    return f"[{name}|{status}]> "
+        return _display_text(f"[{name}|{status} → {peer_name}]> ")
+    return _display_text(f"[{name}|{status}]> ")

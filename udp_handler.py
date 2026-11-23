@@ -14,7 +14,7 @@ Cơ chế hoạt động đa nền tảng (Linux & Windows):
      trước khi bind() (Windows không hỗ trợ SO_REUSEPORT).
    - Bắt ngoại lệ ConnectionResetError (WSAECONNRESET 10054) - lỗi kinh điển
      trên hệ điều hành Windows khi nhận UDP socket.
-   - Lọc gói tin của chính mình dựa vào (name, tcp_port) trong payload.
+   - Lọc gói tin của chính mình bằng instance ID hoặc UDP source port cho HELLO cũ.
    - Tự động phát hiện và loại bỏ các peer không hoạt động sau 10 giây (timeout).
 """
 
@@ -28,6 +28,7 @@ from models import state
 from protocol import (
     encode_hello,
     decode_hello,
+    MAX_UDP_DATAGRAM,
     UDP_PORT,
     UDP_BROADCAST_ADDR,
     UDP_LOOPBACK_ADDR,
@@ -41,53 +42,23 @@ logger = logging.getLogger(__name__)
 # Luồng Broadcaster
 # ---------------------------------------------------------------------------
 
-def broadcaster_thread(notify_fn: Optional[Callable[[str], None]] = None):
+def broadcaster_thread(sock: socket.socket):
     """
     Luồng gửi gói tin quảng bá UDP HELLO mỗi 3 giây.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    # Bắt buộc bật cờ SO_BROADCAST để hệ điều hành cho phép gửi gói broadcast
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    except OSError as e:
-        logger.error(f"[UDP] Không thể thiết lập SO_BROADCAST: {e}")
-
     logger.info(f"[UDP] Broadcaster khởi động -> Danh tính: {state.my_name} ({state.my_tcp_port})")
 
-    while not state.stop_event.is_set():
-        try:
-            packet = encode_hello(state.my_name, state.my_tcp_port, state.my_status)
-
-            # 1. Gửi tới địa chỉ broadcast của mạng LAN thực tế
-            try:
-                sock.sendto(packet, (UDP_BROADCAST_ADDR, UDP_PORT))
-            except OSError as e:
-                logger.debug(f"[UDP] Gửi LAN broadcast thất bại: {e}")
-
-            # 2. Gửi dự phòng tới loopback broadcast (đặc trị cho Linux khi test cùng máy)
-            try:
-                sock.sendto(packet, (UDP_LOOPBACK_ADDR, UDP_PORT))
-            except OSError:
-                # Trên Windows hoặc một số router, địa chỉ 127.255.255.255 sẽ báo lỗi WSAENETUNREACH
-                # Khối try-except này bỏ qua an toàn mà không làm sập luồng
-                pass
-
-        except Exception as e:
-            logger.error(f"[UDP] Lỗi bất ngờ trong broadcaster: {e}")
-
-        # Chia nhỏ chu kỳ ngủ thành từng 0.5s để phản ứng nhanh khi nhận lệnh thoát /quit
-        sleep_elapsed = 0.0
-        while sleep_elapsed < UDP_BROADCAST_INTERVAL:
-            if state.stop_event.is_set():
-                break
-            time.sleep(0.5)
-            sleep_elapsed += 0.5
-
-    try:
-        sock.close()
-    except OSError:
-        pass
+    with sock:
+        while not state.stop_event.is_set():
+            name, port, status = state.my_name, state.my_tcp_port, state.my_status
+            packets = (encode_hello(name, port, status, state.instance_id), encode_hello(name, port, status))
+            for address in dict.fromkeys((UDP_BROADCAST_ADDR, UDP_LOOPBACK_ADDR)):
+                for packet in packets:
+                    try:
+                        sock.sendto(packet, (address, UDP_PORT))
+                    except OSError as e:
+                        logger.debug("[UDP] Không gửi được tới %s: %s", address, e)
+            state.stop_event.wait(UDP_BROADCAST_INTERVAL)
     logger.info("[UDP] Broadcaster đã dừng an toàn.")
 
 
@@ -95,62 +66,50 @@ def broadcaster_thread(notify_fn: Optional[Callable[[str], None]] = None):
 # Luồng Listener
 # ---------------------------------------------------------------------------
 
-def listener_thread(notify_fn: Optional[Callable[[str], None]] = None):
+def _open_listener() -> socket.socket:
     """
-    Luồng lắng nghe gói tin UDP HELLO trên cổng 9999 và cập nhật trạng thái mạng.
+    Bind UDP before reporting discovery readiness.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    # 1. Thiết lập SO_REUSEADDR cho phép tái sử dụng cổng nhanh chóng
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # 2. Kiểm tra điều kiện an toàn cho SO_REUSEPORT (Bắt buộc theo chuẩn đa nền tảng)
-    # Windows không có SO_REUSEPORT, Linux và macOS có hỗ trợ
-    if hasattr(socket, "SO_REUSEPORT"):
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except OSError:
-            pass
-
-    # 3. Gắn socket vào tất cả interface mạng trên cổng UDP_PORT (9999)
     try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
         sock.bind(("", UDP_PORT))
-    except OSError as e:
-        logger.error(f"[UDP] Không thể bind cổng UDP {UDP_PORT}: {e}")
-        if notify_fn:
-            notify_fn(f"[!] Cổng UDP {UDP_PORT} đang bị chiếm dụng. Vui lòng kiểm tra lại tiến trình khác.")
+        sock.settimeout(1.0)
+    except OSError:
         sock.close()
-        return
+        raise
+    return sock
 
-    # Đặt timeout để vòng lặp định kỳ kiểm tra stop_event và peer timeout
-    sock.settimeout(1.0)
-    last_timeout_check = time.time()
 
+def listener_thread(sock: socket.socket, broadcast_port: int, notify_fn: Optional[Callable[[str], None]] = None):
+    """Lắng nghe UDP HELLO và kiểm tra expiry cả khi datagram bị bỏ qua."""
+    last_timeout_check = time.monotonic()
     logger.info(f"[UDP] Listener đang lắng nghe trên 0.0.0.0:{UDP_PORT}")
-
     while not state.stop_event.is_set():
         try:
-            data, (sender_ip, _) = sock.recvfrom(2048)
+            data, (sender_ip, sender_port) = sock.recvfrom(MAX_UDP_DATAGRAM + 1)
             parsed = decode_hello(data)
-            if parsed is None:
-                # Gói tin rác hoặc không đúng định dạng -> Bỏ qua
-                continue
-
-            # Bỏ qua gói tin phát ra từ chính instance này
-            # (Phân biệt qua tcp_port và name vì khi test cùng máy IP sẽ giống nhau)
-            if parsed["tcp_port"] == state.my_tcp_port and parsed["name"] == state.my_name:
-                continue
-
-            # Cập nhật hoặc thêm peer vào danh sách
-            is_new = state.upsert_peer(
-                name=parsed["name"],
-                ip=sender_ip,
-                tcp_port=parsed["tcp_port"],
-                status=parsed["status"],
-            )
-
-            if is_new and notify_fn:
-                notify_fn(f"[*] {parsed['name']} ({sender_ip}:{parsed['tcp_port']}) đã online.")
+            if parsed is not None:
+                instance_id = parsed.get("instance_id")
+                is_self = instance_id == state.instance_id or (
+                    instance_id is None and
+                    (sender_port, parsed["tcp_port"], parsed["name"]) == (
+                        broadcast_port, state.my_tcp_port, state.my_name,
+                    )
+                )
+                if not is_self:
+                    is_new = state.upsert_peer(
+                        name=parsed["name"], ip=sender_ip, tcp_port=parsed["tcp_port"],
+                        status=parsed["status"], instance_id=instance_id,
+                    )
+                    if is_new and notify_fn:
+                        notify_fn(f"[*] {parsed['name']} ({sender_ip}:{parsed['tcp_port']}) đã online.")
 
         except socket.timeout:
             # Hết thời gian chờ 1s mà không có gói tin nào -> Bình thường
@@ -161,12 +120,14 @@ def listener_thread(notify_fn: Optional[Callable[[str], None]] = None):
             # Bắt ngoại lệ này giúp ứng dụng không bị văng crash trên hệ điều hành Windows!
             pass
         except OSError as e:
+            if sock.fileno() == -1:
+                break
             if not state.stop_event.is_set():
                 logger.debug(f"[UDP] Listener socket error: {e}")
 
         # Kiểm tra và xóa các peer bị mất kết nối (timeout > 10s)
-        now = time.time()
-        if now - last_timeout_check >= 2.0:
+        now = time.monotonic()
+        if now - last_timeout_check >= 1.0:
             last_timeout_check = now
             removed = state.remove_timed_out_peers()
             for peer_name in removed:
@@ -188,20 +149,44 @@ def start_udp_threads(notify_fn: Optional[Callable[[str], None]] = None) -> Tupl
     """
     Khởi tạo và chạy các luồng UDP Broadcaster và Listener.
     """
+    listener = _open_listener()
+    broadcaster = None
+    try:
+        broadcaster = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        broadcaster.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        broadcaster.bind(("", 0))
+        broadcast_port = broadcaster.getsockname()[1]
+    except OSError:
+        listener.close()
+        if broadcaster is not None:
+            broadcaster.close()
+        raise
+
     t_broadcaster = threading.Thread(
         target=broadcaster_thread,
-        args=(notify_fn,),
+        args=(broadcaster,),
         name="UDP-Broadcaster",
         daemon=True,
     )
     t_listener = threading.Thread(
         target=listener_thread,
-        args=(notify_fn,),
+        args=(listener, broadcast_port, notify_fn),
         name="UDP-Listener",
         daemon=True,
     )
 
-    t_broadcaster.start()
-    t_listener.start()
+    try:
+        t_listener.start()
+    except RuntimeError:
+        listener.close()
+        broadcaster.close()
+        raise
+    try:
+        t_broadcaster.start()
+    except RuntimeError:
+        listener.close()
+        broadcaster.close()
+        t_listener.join(timeout=2.0)
+        raise
 
     return t_broadcaster, t_listener

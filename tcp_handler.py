@@ -17,21 +17,33 @@ Các tính năng kỹ thuật nâng cao:
    - Hỗ trợ toàn bộ định dạng: .txt, .pdf, .docx, .pptx, .xlsx, .jpg, .png, .mp3, .mp4, .zip, .rar,...
    - Đọc/ghi nhị phân (rb/wb) theo từng chunk 64KB, tối ưu bộ nhớ RAM.
    - Sử dụng os.path.basename loại bỏ tấn công Directory Traversal.
-   - Ghi dữ liệu tạm vào downloads/<filename>.part kèm cập nhật tiến độ %.
-   - Khi nhận đủ 100%: đổi tên thành file chính thức.
+   - Ghi dữ liệu vào file .part riêng cho mỗi lượt nhận và cập nhật tiến độ %.
+   - Khi nhận đủ dữ liệu, publish file hoàn chỉnh và gửi kết quả cho bên gửi.
    - Nếu đứt kết nối giữa chừng: Tự động xóa file .part dở dang để tránh rác ổ đĩa.
 """
 
+import errno
 import logging
+import math
 import os
+import select
+import shutil
 import socket
+import stat
+import struct
+import sys
+import tempfile
 import threading
 import time
+from enum import Enum, auto
+from functools import partial
+from itertools import count
 from typing import Callable, Optional, Tuple, Any
 
-from models import state
+from models import ChatConnection, state
 from protocol import (
     encode_msg,
+    encode_file_ack,
     encode_file_header,
     DELIMITER,
     MAX_FIELD_LEN,
@@ -40,12 +52,21 @@ from protocol import (
     MSG_TYPE_MSG,
     MSG_TYPE_FILE,
     MSG_TYPE_BYE,
+    MSG_TYPE_FILE_ACK,
+    FILE_ACK_VERSION,
+    normalize_peer_name,
 )
 
 logger = logging.getLogger(__name__)
 
 # Kích thước mỗi chunk khi gửi/nhận file (64 KB)
 CHUNK_SIZE = 65536
+CHAT_CONNECT_TIMEOUT = 5.0
+CHAT_WRITE_TIMEOUT = 10.0
+FILE_IO_TIMEOUT = 10.0
+HANDSHAKE_TIMEOUT = 10.0
+MAX_INCOMING_WORKERS = 32
+MAX_FILE_SIZE = 2 * 1024**3
 
 # Thư mục lưu file nhận được
 DOWNLOADS_DIR = "downloads"
@@ -53,13 +74,22 @@ DOWNLOADS_DIR = "downloads"
 # Callbacks hiển thị lên giao diện console
 _msg_cb: Optional[Callable[[str, str, str, bool], None]] = None
 _system_cb: Optional[Callable[[str], None]] = None
+_file_sender_lock = threading.Lock()
+_file_sender: Optional[threading.Thread] = None
+_file_sender_socket: Optional[socket.socket] = None
+_download_lock = threading.Lock()
+_download_reservations: dict[str, dict[str, int]] = {}
+_CONNECT_IN_PROGRESS = {
+    errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, errno.EINTR,
+    getattr(errno, "WSAEWOULDBLOCK", errno.EWOULDBLOCK),
+}
 
 
 # ---------------------------------------------------------------------------
 # Các hàm đọc dữ liệu Socket mức thấp có bảo vệ (Low-level Helpers)
 # ---------------------------------------------------------------------------
 
-def _recv_field(sock: socket.socket) -> str:
+def _recv_field(sock: socket.socket, deadline: Optional[float] = None) -> str:
     """
     Đọc từng byte cho đến khi gặp ký tự phân tách '|'.
     Chống DoS: Nếu đọc quá MAX_FIELD_LEN (4KB) mà chưa thấy '|', ném ValueError.
@@ -67,6 +97,11 @@ def _recv_field(sock: socket.socket) -> str:
     """
     buf = bytearray()
     while True:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Hết thời gian đọc header TCP.")
+            sock.settimeout(remaining)
         try:
             ch = sock.recv(1)
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
@@ -104,121 +139,294 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
-def _cleanup_connection(peer_key: str):
-    """
-    Dọn dẹp socket khi kết nối bị đóng hoặc gặp sự cố.
-    Đồng thời đưa trạng thái chat về màn hình chính nếu đang chat với peer này.
-    """
-    with state.conn_lock:
-        sock = state.connections.pop(peer_key, None)
-    if sock:
-        try:
-            sock.close()
-        except OSError:
-            pass
+def _send_chat_frame(sock: socket.socket, data: bytes, deadline: float):
+    pending = memoryview(data)
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Hết thời gian gửi tin nhắn TCP.")
 
-    # Nếu đang chat với peer này thì đưa dấu nhắc về trạng thái ngoài
-    state.reset_partner_if(peer_key)
+        # A send-only timeout leaves the receiver's blocking reads unchanged.
+        if sys.platform == "win32":
+            timeout = struct.pack("@I", math.ceil(remaining * 1000))
+        else:
+            seconds, microseconds = divmod(math.ceil(remaining * 1_000_000), 1_000_000)
+            fmt = "@li0l" if sys.platform == "darwin" else "@ll"
+            timeout = struct.pack(fmt, seconds, microseconds)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, timeout)
+
+        try:
+            sent = sock.send(pending)
+        except BlockingIOError as e:
+            raise TimeoutError("Hết thời gian gửi tin nhắn TCP.") from e
+        if not sent:
+            raise ConnectionResetError("Socket đóng trong lúc gửi tin nhắn TCP.")
+        pending = pending[sent:]
+
+
+def _connect_socket(sock: socket.socket, endpoint: tuple[str, int], timeout: float):
+    if state.stop_event.is_set():
+        raise ConnectionAbortedError("Đang đóng ứng dụng.")
+    deadline = time.monotonic() + timeout
+    sock.setblocking(False)
+    error = sock.connect_ex(endpoint)
+    while error in _CONNECT_IN_PROGRESS and not state.stop_event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Hết thời gian kết nối TCP.")
+        _, writable, failed = select.select([], [sock], [sock], min(remaining, 0.1))
+        if writable or failed:
+            error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+
+    if state.stop_event.is_set():
+        raise ConnectionAbortedError("Đang đóng ứng dụng.")
+    if error:
+        raise OSError(error, os.strerror(error))
+    sock.settimeout(timeout)
+
+
+def _shutdown_socket(sock: socket.socket):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _close_chat_socket(sock: socket.socket):
+    _shutdown_socket(sock)
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _register_chat_connection(
+    peer_key: str, peer_ip: str, peer_port: int, candidate: ChatConnection
+) -> Optional[ChatConnection]:
+    # At both ends, prefer the connection initiated by the lower listening endpoint.
+    local_endpoint = (candidate.sock.getsockname()[0], state.my_tcp_port)
+    prefer_outgoing = local_endpoint < (peer_ip, peer_port)
+
+    with state.conn_lock:
+        existing = state.connections.get(peer_key)
+        if state.stop_event.is_set():
+            winner = None
+        elif existing is None:
+            winner = candidate
+        elif existing.outgoing != candidate.outgoing:
+            winner = candidate if candidate.outgoing == prefer_outgoing else existing
+        else:
+            winner = existing if candidate.outgoing else candidate
+
+        if winner is candidate:
+            state.connections[peer_key] = candidate
+
+    if winner is not candidate:
+        _close_chat_socket(candidate.sock)
+    elif existing is not None:
+        _close_chat_socket(existing.sock)
+    return winner
+
+
+def _cleanup_connection(peer_key: str, sock: socket.socket) -> bool:
+    """Close this socket and clear the session only if it still owns the entry."""
+    with state.conn_lock:
+        current = state.connections.get(peer_key)
+        removed = current is not None and current.sock is sock
+        if removed:
+            del state.connections[peer_key]
+            state.reset_partner_if(peer_key)
+    _close_chat_socket(sock)
+    return removed
+
+
+def close_chat_connections():
+    with state.conn_lock:
+        sockets = {conn.sock for conn in state.connections.values()}
+        dialing = state.dialing_chat_sockets - sockets
+        state.connections.clear()
+        for ready in state.pending_chat_dials.values():
+            ready.set()
+    for sock in sockets:
+        _close_chat_socket(sock)
+    for sock in dialing:
+        _shutdown_socket(sock)
+
+
+def _start_tcp_worker(sock, handler, args, *, incoming=False) -> bool:
+    def run():
+        try:
+            handler(sock, *args)
+        finally:
+            try:
+                sock.close()
+            finally:
+                with state.conn_lock:
+                    state.tcp_workers.pop(sock, None)
+
+    with state.conn_lock:
+        if state.stop_event.is_set():
+            return False
+        if incoming and sum(is_incoming for _, is_incoming in state.tcp_workers.values()) >= MAX_INCOMING_WORKERS:
+            return False
+        worker = threading.Thread(target=run, name="TCP-Incoming" if incoming else "TCP-Recv", daemon=True)
+        state.tcp_workers[sock] = (worker, incoming)
+        try:
+            worker.start()
+        except RuntimeError:
+            del state.tcp_workers[sock]
+            logger.exception("[TCP] Không thể khởi động connection worker.")
+            return False
+        return True
+
+
+def drain_tcp_workers(timeout: float = 2.0) -> bool:
+    """Wake registered TCP workers after stop_event has been set."""
+    with state.conn_lock:
+        workers = list(state.tcp_workers.items())
+    for sock, _ in workers:
+        _shutdown_socket(sock)
+
+    deadline = time.monotonic() + timeout
+    for _, (worker, _) in workers:
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+    return all(not worker.is_alive() for _, (worker, _) in workers)
 
 
 # ---------------------------------------------------------------------------
 # Xử lý nhận file nhị phân với cơ chế .part
 # ---------------------------------------------------------------------------
 
+class FileSendResult(Enum):
+    SAVED = auto()
+    UNCONFIRMED = auto()
+    FAILED = auto()
+
+
+def _open_download_part(directory: str, filesize: int):
+    with _download_lock:
+        transfers = _download_reservations.get(directory, {})
+        reserved = sum(transfers.values())
+        existing = 0
+        written = 0
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                planned = transfers.get(entry.path)
+                if planned is None:
+                    existing += metadata.st_size
+                else:
+                    written += min(metadata.st_size, planned)
+
+        if existing + reserved + filesize > state.download_quota_bytes:
+            raise OSError(errno.ENOSPC, "Lượt nhận vượt quota thư mục downloads.")
+        if reserved - written + filesize > shutil.disk_usage(directory).free:
+            raise OSError(errno.ENOSPC, "Không đủ dung lượng trống cho lượt nhận.")
+
+        part = tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".lan-chat-", suffix=".part", dir=directory, delete=False,
+        )
+        _download_reservations.setdefault(directory, {})[part.name] = filesize
+        return part
+
+
+def _discard_download_part(directory: str, part_path: str):
+    """Release a reservation under _download_lock after removing its temp file."""
+    try:
+        os.unlink(part_path)
+    except OSError as e:
+        logger.warning(f"[TCP] Không thể dọn file tạm '{part_path}': {e}")
+    transfers = _download_reservations[directory]
+    del transfers[part_path]
+    if not transfers:
+        del _download_reservations[directory]
+
+
+def _publish_file(part_path: str, filename: str, directory: str) -> str:
+    stem, ext = os.path.splitext(filename)
+    for suffix in count():
+        name = f"{stem}_{suffix}{ext}" if suffix else filename
+        final_path = os.path.join(directory, name)
+        try:
+            os.link(part_path, final_path)
+        except FileExistsError:
+            continue
+        return final_path
+
+
 def _receive_file_stream(sock: socket.socket, raw_filename: str, filesize: int, sender_name: str):
     """
     Nhận dữ liệu nhị phân của file theo chunk, ghi vào .part và đổi tên khi hoàn tất.
     Tự động xóa file .part nếu kết nối bị đứt giữa chừng.
     """
-    # 1. Bảo vệ chống Directory Traversal: Chỉ lấy tên file gốc
     safe_filename = os.path.basename(raw_filename).replace("|", "_").strip()
-    if not safe_filename:
+    if safe_filename in ("", ".", ".."):
         safe_filename = "downloaded_file"
 
-    # Tạo thư mục downloads nếu chưa tồn tại
-    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-
-    # 2. Xử lý trùng tên file: Nếu file đã tồn tại, tự sinh tên mới <stem>_1.<ext>
-    base_name, ext = os.path.splitext(safe_filename)
-    counter = 1
-    final_filename = safe_filename
-    final_path = os.path.join(DOWNLOADS_DIR, final_filename)
-    while os.path.exists(final_path):
-        final_filename = f"{base_name}_{counter}{ext}"
-        final_path = os.path.join(DOWNLOADS_DIR, final_filename)
-        counter += 1
-
-    # Tên file tạm thời trong quá trình truyền
-    part_path = os.path.join(DOWNLOADS_DIR, f"{final_filename}.part")
-
-    if _system_cb:
-        size_kb = filesize / 1024
-        _system_cb(f"[*] Đang nhận file '{safe_filename}' ({size_kb:.1f} KB) từ {sender_name}...")
-
-    received_bytes = 0
-    file_obj = None
-
+    part_path = None
+    saved = False
+    directory = os.path.abspath(os.path.join(state.data_dir, DOWNLOADS_DIR))
     try:
-        # Mở file nhị phân ở chế độ 'wb' (hỗ trợ mọi định dạng: .pdf, .docx, .zip, .mp4, ...)
-        file_obj = open(part_path, "wb")
-        last_reported_pct = -1
+        sock.settimeout(FILE_IO_TIMEOUT)
+        if state.stop_event.is_set():
+            return
+        if not 0 <= filesize <= MAX_FILE_SIZE:
+            raise ValueError(f"Kích thước file phải từ 0 đến {MAX_FILE_SIZE} bytes.")
+        os.makedirs(directory, exist_ok=True)
+        part = _open_download_part(directory, filesize)
+        part_path = part.name
+        with part:
+            if _system_cb:
+                _system_cb(f"[*] Đang nhận file '{safe_filename}' từ {sender_name} ({filesize} bytes)...")
+            received = 0
+            last_milestone = -1
+            while received < filesize:
+                chunk = sock.recv(min(CHUNK_SIZE, filesize - received))
+                if not chunk:
+                    raise ConnectionResetError("Kết nối truyền file bị đứt giữa chừng.")
+                part.write(chunk)
+                received += len(chunk)
+                milestone = (received * 4 // filesize) * 25
+                if milestone > last_milestone and _system_cb:
+                    last_milestone = milestone
+                    filled = milestone // 5
+                    bar = "█" * filled + "░" * (20 - filled)
+                    _system_cb(
+                        f"  [Tiến độ file] [{bar}] {milestone}% "
+                        f"({received // 1024}/{filesize // 1024} KB) '{safe_filename}'"
+                    )
 
-        while received_bytes < filesize:
-            to_read = min(CHUNK_SIZE, filesize - received_bytes)
-            chunk = sock.recv(to_read)
-
-            if not chunk:
-                raise ConnectionResetError("Kết nối truyền file bị đứt giữa chừng từ phía người gửi.")
-
-            file_obj.write(chunk)
-            received_bytes += len(chunk)
-
-            # Cập nhật tiến độ % ra màn hình console (mỗi mốc 25%)
-            pct = int(received_bytes * 100 / filesize) if filesize > 0 else 100
-            milestone = (pct // 25) * 25
-            if milestone > last_reported_pct and _system_cb:
-                last_reported_pct = milestone
-                filled = milestone // 5
-                bar = "█" * filled + "░" * (20 - filled)
-                _system_cb(
-                    f"  [Tiến độ file] [{bar}] {milestone}% "
-                    f"({received_bytes // 1024}/{filesize // 1024} KB) '{safe_filename}'"
-                )
-
-        # Đóng file tạm sau khi đã ghi đủ 100% số byte
-        file_obj.close()
-        file_obj = None
-
-        # Đổi tên file từ .part thành tên chính thức
-        if os.path.exists(part_path):
-            os.replace(part_path, final_path)
-
+        with _download_lock:
+            if state.stop_event.is_set():
+                raise ConnectionAbortedError("Đang đóng ứng dụng.")
+            final_path = _publish_file(part_path, safe_filename, directory)
+            _discard_download_part(directory, part_path)
+            part_path = None
+        saved = True
         if _system_cb:
-            _system_cb(f"[OK] Đã nhận thành công '{final_filename}' -> Lưu tại: {os.path.abspath(final_path)}")
+            _system_cb(f"[OK] Đã lưu file tại {os.path.abspath(final_path)}")
 
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ConnectionError, OSError) as e:
-        # Nếu đứt kết nối hoặc có lỗi I/O:
-        if file_obj:
-            try:
-                file_obj.close()
-            except OSError:
-                pass
-
-        # BẮT BUỘC: Tự động xóa file .part dở dang để bảo vệ ổ đĩa
-        if os.path.exists(part_path):
-            try:
-                os.remove(part_path)
-            except OSError:
-                pass
-
-        logger.error(f"[TCP] Nhận file '{safe_filename}' thất bại: {e}")
-        if _system_cb:
-            _system_cb(f"[!] Nhận file '{safe_filename}' thất bại do mất kết nối giữa chừng.")
+    except (OSError, ValueError) as e:
+        if not state.stop_event.is_set():
+            logger.error(f"[TCP] Nhận file '{safe_filename}' thất bại: {e}")
+            if _system_cb:
+                reason = e.strerror if isinstance(e, OSError) and e.errno == errno.ENOSPC else "Lượt nhận bị gián đoạn."
+                _system_cb(f"[!] Nhận file '{safe_filename}' thất bại. {reason}")
     finally:
+        if part_path is not None:
+            with _download_lock:
+                _discard_download_part(directory, part_path)
         try:
-            sock.close()
+            sock.sendall(encode_file_ack(saved))
         except OSError:
             pass
+        finally:
+            sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +446,7 @@ def _receiver_loop(sock: socket.socket, peer_key: str, peer_name_hint: str = "")
 
     logger.info(f"[TCP] Luồng nhận tin bắt đầu cho: {peer_name} ({peer_key})")
 
+    notice = None
     try:
         while not state.stop_event.is_set():
             # 1. Đọc loại frame
@@ -260,10 +469,14 @@ def _receiver_loop(sock: socket.socket, peer_key: str, peer_name_hint: str = "")
                 log_entry = f"[{timestamp}] {peer_name}: {content}"
 
                 with state.lock:
-                    state.chat_history.setdefault(peer_key, []).append(log_entry)
+                    history = state.chat_history.setdefault(peer_key, [])
                     is_current = (state.current_partner == peer_key)
                     if not is_current:
-                        state.unread_counts[peer_key] = state.unread_counts.get(peer_key, 0) + 1
+                        unread = state.unread_counts.get(peer_key, 0)
+                        if unread == 0:
+                            state.first_unread[peer_key] = len(history)
+                        state.unread_counts[peer_key] = unread + 1
+                    history.append(log_entry)
 
                 if _msg_cb:
                     _msg_cb(peer_key, peer_name, content, is_current)
@@ -279,17 +492,17 @@ def _receiver_loop(sock: socket.socket, peer_key: str, peer_name_hint: str = "")
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ConnectionError, OSError) as e:
         # Bắt lỗi khi peer ngắt kết nối đột ngột (tắt terminal, rút dây mạng...)
         logger.info(f"[TCP] Peer {peer_name} ngắt kết nối: {e}")
-        if _system_cb and not state.stop_event.is_set():
-            _system_cb(f"[*] Kết nối với {peer_name} đã bị ngắt.")
+        notice = f"[*] Kết nối với {peer_name} đã bị ngắt."
 
     except ValueError as e:
         # Bắt lỗi gói tin rác (malformed packet) từ client lạ
         logger.warning(f"[TCP] Nhận gói tin rác từ {peer_name}: {e}")
-        if _system_cb and not state.stop_event.is_set():
-            _system_cb(f"[!] Gói tin không hợp lệ từ {peer_name}, đã đóng kết nối.")
+        notice = f"[!] Gói tin không hợp lệ từ {peer_name}, đã đóng kết nối."
 
     finally:
-        _cleanup_connection(peer_key)
+        removed = _cleanup_connection(peer_key, sock)
+        if removed and notice and _system_cb and not state.stop_event.is_set():
+            _system_cb(notice)
 
 
 # ---------------------------------------------------------------------------
@@ -302,51 +515,49 @@ def _handle_incoming(conn: socket.socket, addr: Tuple[str, int]):
     Phân loại kết nối: CHAT (lâu dài) hoặc FILE (truyền 1 lần).
     """
     try:
-        conn.settimeout(10.0)  # Chờ header nhận diện tối đa 10s
-        first_field = _recv_field(conn)
+        deadline = time.monotonic() + HANDSHAKE_TIMEOUT
+        read_field = partial(_recv_field, conn, deadline=deadline)
+        first_field = read_field()
 
         if first_field == MSG_TYPE_HELLO:
             # Format: HELLO|<name>|<tcp_port>|<conn_type>|
-            peer_name = _recv_field(conn)
-            peer_tcp_port = int(_recv_field(conn))
-            conn_type = _recv_field(conn)  # "CHAT" hoặc "FILE"
+            peer_name = read_field()
+            peer_tcp_port = int(read_field())
+            if not 1 <= peer_tcp_port <= 65535:
+                raise ValueError("TCP port của peer ngoài phạm vi hợp lệ.")
+            conn_type = read_field()  # "CHAT" hoặc "FILE"
             peer_ip = addr[0]
-            peer_key = state.get_peer_key(peer_ip, peer_tcp_port)
-
-            conn.settimeout(None)  # Trả về chế độ blocking bình thường
+            peer_key = state.resolve_peer_key(peer_ip, peer_tcp_port)
 
             if conn_type == MSG_TYPE_FILE:
                 # Đây là kết nối riêng biệt để nhận file
-                next_field = _recv_field(conn)
+                next_field = read_field()
                 if next_field != MSG_TYPE_FILE:
                     raise ValueError("Kỳ vọng gói tin FILE sau HELLO|FILE")
-                filename = _recv_field(conn)
-                filesize = int(_recv_field(conn))
+                filename = read_field()
+                filesize = int(read_field())
                 _receive_file_stream(conn, filename, filesize, peer_name)
                 return
 
-            else:
+            elif conn_type == "CHAT":
                 # Kết nối CHAT thông thường
-                with state.conn_lock:
-                    old_sock = state.connections.get(peer_key)
-                    if old_sock:
-                        try:
-                            old_sock.close()
-                        except OSError:
-                            pass
-                    state.connections[peer_key] = conn
+                conn.settimeout(None)
+                candidate = ChatConnection(conn, outgoing=False)
+                if _register_chat_connection(peer_key, peer_ip, peer_tcp_port, candidate) is not candidate:
+                    return
 
                 logger.info(f"[TCP] Chấp nhận kết nối CHAT từ {peer_name} ({peer_key})")
                 if _system_cb:
                     _system_cb(f"[*] {peer_name} đã kết nối vào trò chuyện.")
 
                 _receiver_loop(conn, peer_key, peer_name_hint=peer_name)
+            else:
+                raise ValueError("Loại connection TCP không hợp lệ.")
 
         elif first_field == MSG_TYPE_FILE:
             # Hỗ trợ nhận diện file gửi trực tiếp: FILE|<filename>|<filesize>|
-            filename = _recv_field(conn)
-            filesize = int(_recv_field(conn))
-            conn.settimeout(None)
+            filename = read_field()
+            filesize = int(read_field())
             sender_name = addr[0]
             with state.lock:
                 for p in state.peer_list.values():
@@ -377,47 +588,23 @@ def _handle_incoming(conn: socket.socket, addr: Tuple[str, int]):
 # Luồng Acceptor (Lắng nghe kết nối TCP)
 # ---------------------------------------------------------------------------
 
-def acceptor_thread():
+def acceptor_thread(server_sock: socket.socket):
     """
     Luồng lắng nghe kết nối TCP trên cổng state.my_tcp_port.
     """
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    try:
-        server_sock.bind(("", state.my_tcp_port))
-        server_sock.listen(15)
-        server_sock.settimeout(1.0)
-    except OSError as e:
-        logger.error(f"[TCP] Không thể bind cổng TCP {state.my_tcp_port}: {e}")
-        if _system_cb:
-            _system_cb(f"[!] Cổng TCP {state.my_tcp_port} đang bị chiếm dụng!")
-        server_sock.close()
-        return
-
     logger.info(f"[TCP] Acceptor đang lắng nghe trên cổng {state.my_tcp_port}")
 
-    while not state.stop_event.is_set():
-        try:
-            conn, addr = server_sock.accept()
-            # Khởi chạy một luồng daemon riêng để xử lý kết nối này
-            t = threading.Thread(
-                target=_handle_incoming,
-                args=(conn, addr),
-                name=f"TCP-Conn-{addr}",
-                daemon=True,
-            )
-            t.start()
-        except socket.timeout:
-            pass
-        except OSError as e:
-            if not state.stop_event.is_set():
-                logger.error(f"[TCP] Lỗi Acceptor: {e}")
-
-    try:
-        server_sock.close()
-    except OSError:
-        pass
+    with server_sock:
+        while not state.stop_event.is_set():
+            try:
+                conn, addr = server_sock.accept()
+                if not _start_tcp_worker(conn, _handle_incoming, (addr,), incoming=True):
+                    conn.close()
+            except socket.timeout:
+                pass
+            except OSError as e:
+                if not state.stop_event.is_set():
+                    logger.error(f"[TCP] Lỗi Acceptor: {e}")
     logger.info("[TCP] Acceptor đã dừng an toàn.")
 
 
@@ -431,41 +618,73 @@ def get_or_connect(peer_key: str) -> Optional[socket.socket]:
     Bắt lỗi mạng và trả về None nếu không thể kết nối.
     """
     with state.conn_lock:
+        if state.stop_event.is_set():
+            return None
         existing = state.connections.get(peer_key)
-    if existing:
-        return existing
+        if existing is not None:
+            return existing.sock
+        pending = state.pending_chat_dials.get(peer_key)
+        if pending is None:
+            ready = threading.Event()
+            state.pending_chat_dials[peer_key] = ready
 
-    with state.lock:
-        peer = state.peer_list.get(peer_key)
-    if peer is None:
-        return None
+    if pending is not None:
+        pending.wait(timeout=2 * CHAT_CONNECT_TIMEOUT)
+        with state.conn_lock:
+            existing = state.connections.get(peer_key)
+            return existing.sock if existing is not None and not state.stop_event.is_set() else None
 
     try:
+        return _dial_chat(peer_key)
+    finally:
+        with state.conn_lock:
+            del state.pending_chat_dials[peer_key]
+            ready.set()
+
+
+def _dial_chat(peer_key: str) -> Optional[socket.socket]:
+    with state.lock:
+        peer = state.peer_list.get(peer_key)
+        if peer is None:
+            return None
+        peer_ip, peer_port, peer_name = peer.ip, peer.tcp_port, peer.name
+
+    sock = None
+    try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect((peer.ip, peer.tcp_port))
-        sock.settimeout(None)
+        with state.conn_lock:
+            if state.stop_event.is_set():
+                raise ConnectionAbortedError("Đang đóng ứng dụng.")
+            state.dialing_chat_sockets.add(sock)
+        _connect_socket(sock, (peer_ip, peer_port), CHAT_CONNECT_TIMEOUT)
 
         # Gửi lời chào nhận diện loại CHAT
-        hello_frame = f"{MSG_TYPE_HELLO}|{state.my_name}|{state.my_tcp_port}|CHAT|".encode("utf-8")
+        hello_frame = f"{MSG_TYPE_HELLO}|{normalize_peer_name(state.my_name)}|{state.my_tcp_port}|CHAT|".encode("utf-8")
         sock.sendall(hello_frame)
+        sock.settimeout(None)
 
-        with state.conn_lock:
-            state.connections[peer_key] = sock
+        candidate = ChatConnection(sock, outgoing=True)
+        winner = _register_chat_connection(peer_key, peer_ip, peer_port, candidate)
+        if winner is not candidate:
+            return winner.sock if winner is not None else None
 
         # Bật luồng đọc tin từ phía đối tác
-        t = threading.Thread(
-            target=_receiver_loop,
-            args=(sock, peer_key, peer.name),
-            name=f"TCP-Recv-{peer.name}",
-            daemon=True,
-        )
-        t.start()
+        if not _start_tcp_worker(sock, _receiver_loop, (peer_key, peer_name)):
+            _cleanup_connection(peer_key, sock)
+            return None
         return sock
 
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ConnectionError, OSError) as e:
+    except (OSError, RuntimeError) as e:
         logger.debug(f"[TCP] Không thể kết nối tới {peer_key}: {e}")
-        return None
+        if sock is not None:
+            _cleanup_connection(peer_key, sock)
+        with state.conn_lock:
+            existing = state.connections.get(peer_key)
+            return existing.sock if existing is not None and not state.stop_event.is_set() else None
+    finally:
+        if sock is not None:
+            with state.conn_lock:
+                state.dialing_chat_sockets.discard(sock)
 
 
 def send_chat_message(peer_key: str, content: str) -> bool:
@@ -473,121 +692,191 @@ def send_chat_message(peer_key: str, content: str) -> bool:
     Gửi tin nhắn văn bản tới peer qua TCP.
     Bắt toàn bộ lỗi ngắt kết nối đột ngột, dọn dẹp state và không ném traceback.
     """
-    sock = get_or_connect(peer_key)
-    if sock is None:
+    data = encode_msg(content)
+    if get_or_connect(peer_key) is None:
+        return False
+    with state.conn_lock:
+        conn = state.connections.get(peer_key)
+    if conn is None:
+        return False
+
+    deadline = time.monotonic() + CHAT_WRITE_TIMEOUT
+    if not conn.write_lock.acquire(timeout=CHAT_WRITE_TIMEOUT):
         return False
 
     try:
-        data = encode_msg(content)
-        sock.sendall(data)
+        with state.conn_lock:
+            if state.stop_event.is_set() or state.connections.get(peer_key) is not conn:
+                return False
+        _send_chat_frame(conn.sock, data, deadline)
         return True
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ConnectionError, OSError) as e:
+    except OSError as e:
         logger.error(f"[TCP] Lỗi khi gửi tin nhắn tới {peer_key}: {e}")
-        _cleanup_connection(peer_key)
-        if _system_cb:
+        removed = _cleanup_connection(peer_key, conn.sock)
+        if removed and _system_cb:
             with state.lock:
                 peer = state.peer_list.get(peer_key)
                 name = peer.name if peer else peer_key
             _system_cb(f"[*] Kết nối với {name} đã bị ngắt.")
         return False
+    finally:
+        conn.write_lock.release()
 
 
-def send_file(peer_key: str, filepath: str, progress_fn: Optional[Callable[[int, int], None]] = None) -> bool:
+def _receive_file_ack(sock: socket.socket) -> FileSendResult:
+    read_field = partial(_recv_field, sock, deadline=time.monotonic() + FILE_IO_TIMEOUT)
+    try:
+        if read_field() == MSG_TYPE_FILE_ACK and read_field() == FILE_ACK_VERSION:
+            result = read_field()
+            if result == "OK":
+                return FileSendResult.SAVED
+            if result == "ERROR":
+                return FileSendResult.FAILED
+    except (OSError, ValueError):
+        pass
+    return FileSendResult.UNCONFIRMED
+
+
+def _open_source(path: str, flags: int) -> int:
+    # A path replaced by a FIFO after the CLI check must not block open().
+    return os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+
+
+def send_file(
+    peer_key: str, filepath: str, progress_fn: Optional[Callable[[int, int], None]] = None,
+) -> FileSendResult:
     """
     Mở một kết nối TCP độc lập để truyền file nhị phân mọi định dạng.
     Đọc file theo từng chunk 64KB, cập nhật tiến độ %.
     Bắt lỗi mạng và giải phóng socket an toàn.
     """
+    global _file_sender_socket
     with state.lock:
         peer = state.peer_list.get(peer_key)
-    if peer is None:
-        return False
-
-    if not os.path.isfile(filepath):
-        logger.error(f"[TCP] Đường dẫn file không hợp lệ hoặc không tồn tại: {filepath}")
-        return False
+        if peer is None:
+            return FileSendResult.FAILED
+        endpoint = (peer.ip, peer.tcp_port)
 
     try:
-        filesize = os.path.getsize(filepath)
         filename = os.path.basename(filepath)
+        with open(filepath, "rb", opener=_open_source) as source:
+            metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(errno.EINVAL, "Nguồn gửi phải là file thường.")
+            filesize = metadata.st_size
+            if filesize > MAX_FILE_SIZE:
+                raise OSError(f"File vượt quá {MAX_FILE_SIZE} bytes.")
 
-        # Mở kết nối TCP riêng biệt chuyên dụng cho File Transfer
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10.0)
-        sock.connect((peer.ip, peer.tcp_port))
-        sock.settimeout(None)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                with _file_sender_lock:
+                    if state.stop_event.is_set():
+                        return FileSendResult.FAILED
+                    _file_sender_socket = sock
+                try:
+                    _connect_socket(sock, endpoint, FILE_IO_TIMEOUT)
+                    hello = f"{MSG_TYPE_HELLO}|{normalize_peer_name(state.my_name)}|{state.my_tcp_port}|{MSG_TYPE_FILE}|"
+                    sock.sendall(hello.encode("utf-8"))
+                    sock.sendall(encode_file_header(filename, filesize))
 
-        # 1. Gửi định danh HELLO loại FILE
-        hello_frame = f"{MSG_TYPE_HELLO}|{state.my_name}|{state.my_tcp_port}|{MSG_TYPE_FILE}|".encode("utf-8")
-        sock.sendall(hello_frame)
+                    sent_bytes = 0
+                    while sent_bytes < filesize and not state.stop_event.is_set():
+                        chunk = source.read(min(CHUNK_SIZE, filesize - sent_bytes))
+                        if not chunk:
+                            raise OSError("Tệp nguồn ngắn hơn kích thước đã thông báo.")
+                        sock.sendall(chunk)
+                        sent_bytes += len(chunk)
+                        if progress_fn and not state.stop_event.is_set():
+                            progress_fn(sent_bytes, filesize)
+                    if state.stop_event.is_set():
+                        return FileSendResult.FAILED
+                    if progress_fn and filesize == 0:
+                        progress_fn(0, 0)
+                    return _receive_file_ack(sock)
+                finally:
+                    with _file_sender_lock:
+                        _file_sender_socket = None
 
-        # 2. Gửi header FILE: FILE|<filename>|<filesize>|
-        file_header = encode_file_header(filename, filesize)
-        sock.sendall(file_header)
+    except OSError as e:
+        if not state.stop_event.is_set():
+            logger.error(f"[TCP] Gửi file '{filepath}' tới {peer_key} thất bại: {e}")
+        return FileSendResult.FAILED
 
-        # 3. Đọc nhị phân ('rb') và truyền từng chunk 64KB
-        sent_bytes = 0
-        with open(filepath, "rb") as f:
-            while sent_bytes < filesize:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                sock.sendall(chunk)
-                sent_bytes += len(chunk)
-                if progress_fn:
-                    progress_fn(sent_bytes, filesize)
 
-        try:
-            sock.close()
-        except OSError:
-            pass
+def start_file_send(
+    peer_key: str,
+    filepath: str,
+    progress_fn: Callable[[int, int], None],
+    done_fn: Callable[[FileSendResult], None],
+) -> bool:
+    """Start one outgoing transfer and report its result on the worker."""
+    global _file_sender
 
+    def transfer():
+        result = send_file(peer_key, filepath, progress_fn)
+        if not state.stop_event.is_set():
+            done_fn(result)
+
+    with _file_sender_lock:
+        if state.stop_event.is_set() or (_file_sender is not None and _file_sender.is_alive()):
+            return False
+        worker = threading.Thread(target=transfer, name="TCP-File-Sender", daemon=True)
+        worker.start()
+        _file_sender = worker
         return True
 
-    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ConnectionError, OSError) as e:
-        logger.error(f"[TCP] Gửi file '{filepath}' tới {peer_key} thất bại: {e}")
-        return False
+
+def stop_file_sender(timeout: float = 2.0) -> bool:
+    """Interrupt the active upload after stop_event is set."""
+    with _file_sender_lock:
+        worker = _file_sender
+        sock = _file_sender_socket
+    if sock is not None:
+        _shutdown_socket(sock)
+    if worker is not None:
+        worker.join(timeout=timeout)
+        return not worker.is_alive()
+    return True
 
 
 # ---------------------------------------------------------------------------
 # Luồng Auto-reconnect
 # ---------------------------------------------------------------------------
 
-def _reconnect_worker():
-    """
-    Luồng tự động kết nối lại với đối tác hiện tại nếu kết nối bị đứt
-    nhưng peer vẫn còn online trên mạng LAN (nhận qua UDP).
-    """
-    while not state.stop_event.is_set():
-        state.stop_event.wait(timeout=15.0)
-        if state.stop_event.is_set():
-            break
-
+def _reconnect_selected_peer():
+    with state.conn_lock:
         with state.lock:
-            partner = state.current_partner
-        if not partner:
-            continue
+            partner = state.reconnect_partner
+            if partner not in state.peer_list:
+                return
+            if state.current_partner == partner and partner in state.connections:
+                return
 
-        with state.conn_lock:
-            connected = partner in state.connections
-        if connected:
-            continue
+    if get_or_connect(partner) is None:
+        return
 
+    with state.conn_lock:
         with state.lock:
             peer = state.peer_list.get(partner)
-        if not peer:
-            continue
+            if (
+                state.stop_event.is_set() or state.reconnect_partner != partner or peer is None
+                or partner not in state.connections or state.current_partner == partner
+            ):
+                return
+            state.current_partner = partner
+            name = peer.name
+    if _system_cb:
+        _system_cb(f"[*] Đã tự động kết nối lại thành công với {name}.")
 
-        # Thử tái lập kết nối
-        sock = get_or_connect(partner)
-        if sock and _system_cb:
-            _system_cb(f"[*] Đã tự động kết nối lại thành công với {peer.name}.")
+
+def _reconnect_worker():
+    while not state.stop_event.wait(timeout=15.0):
+        _reconnect_selected_peer()
 
 
 def start_tcp_threads(
     msg_callback: Optional[Callable[[str, str, str, bool], None]] = None,
     system_callback: Optional[Callable[[str], None]] = None,
-) -> threading.Thread:
+) -> Tuple[threading.Thread, threading.Thread]:
     """
     Khởi động các luồng TCP Acceptor và Auto-reconnect.
     """
@@ -595,18 +884,33 @@ def start_tcp_threads(
     _msg_cb = msg_callback
     _system_cb = system_callback
 
-    t_acceptor = threading.Thread(
-        target=acceptor_thread,
-        name="TCP-Acceptor",
-        daemon=True,
-    )
-    t_acceptor.start()
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(("", state.my_tcp_port))
+        server_sock.listen(15)
+        server_sock.settimeout(1.0)
+        t_acceptor = threading.Thread(
+            target=acceptor_thread, args=(server_sock,), name="TCP-Acceptor", daemon=True,
+        )
+        t_acceptor.start()
+    except (OSError, RuntimeError):
+        server_sock.close()
+        raise
 
     t_reconnect = threading.Thread(
         target=_reconnect_worker,
         name="TCP-Reconnect",
         daemon=True,
     )
-    t_reconnect.start()
+    try:
+        t_reconnect.start()
+    except RuntimeError:
+        state.stop_event.set()
+        server_sock.close()
+        t_acceptor.join(timeout=2.0)
+        close_chat_connections()
+        drain_tcp_workers()
+        raise
 
-    return t_acceptor
+    return t_acceptor, t_reconnect

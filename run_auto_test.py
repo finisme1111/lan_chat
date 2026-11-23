@@ -1,335 +1,272 @@
 #!/usr/bin/env python3
-"""
-run_auto_test.py - Kịch bản kiểm thử tự động toàn diện cho LAN Chat & File Sharing P2P
-Mục đích:
-- Kiểm thử tự động không cần can thiệp thủ công.
-- Mô phỏng 2 Peer (Quan : 5001 và Minh : 5002) chạy ngầm qua subprocess.
-- Kiểm tra 6 Test Case cốt lõi:
-    TC1 - UDP Discovery tự động
-    TC2 - Cập nhật và đồng bộ trạng thái UDP (away)
-    TC3 - Trò chuyện 1-1 qua TCP (Chat message)
-    TC4 - Truyền tệp nhị phân 5MB và kiểm tra toàn vẹn băm SHA-256
-    TC5 - Khả năng chống crash khi nhận gói tin rác (Malformed Packet)
-    TC6 - Xử lý an toàn khi đối tác ngắt kết nối đột ngột (Abrupt termination)
-"""
-
+"""Smoke test hai peer thật trên loopback, với storage tạm riêng."""
 import hashlib
+import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
 import threading
-import time
-from typing import List, Tuple
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-# Màu hiển thị console
-GREEN = "\033[92m"
-RED = "\033[91m"
-YELLOW = "\033[93m"
-CYAN = "\033[96m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
-
-TEST_FILENAME = "test_data.bin"
-TEST_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
-DOWNLOADS_DIR = "downloads"
+TEST_FILE_SIZE = 5 * 1024 * 1024
+TEST_QUOTA_GIB = 1
+SCRIPT = Path(__file__).resolve()
 
 
 class ProcessMonitor:
-    """Quản lý và đọc log stdout/stderr của tiến trình peer ngầm."""
-    def __init__(self, name: str, port: int):
+    def __init__(self, name, port, udp_port, directory):
         self.name = name
         self.port = port
-        self.proc: subprocess.Popen = None
-        self.logs: List[str] = []
-        self._lock = threading.Lock()
-        self._thread: threading.Thread = None
+        self.udp_port = udp_port
+        self.directory = directory
+        self.proc = None
+        self.logs = []
+        self.changed = threading.Condition()
+        self.reader = None
 
     def start(self):
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
         self.proc = subprocess.Popen(
-            [sys.executable, "main.py", "--name", self.name, "--port", str(self.port)],
+            [
+                sys.executable, "-B", str(SCRIPT), "--peer", str(self.udp_port),
+                "--name", self.name, "--port", str(self.port), "--data-dir", str(self.directory),
+                "--download-quota-gib", str(TEST_QUOTA_GIB),
+            ],
+            cwd=self.directory,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,
-            env=env,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"},
         )
-        self._thread = threading.Thread(target=self._reader, daemon=True)
-        self._thread.start()
+        self.reader = threading.Thread(target=self._read_output, daemon=True)
+        self.reader.start()
 
-    def _reader(self):
+    def _read_output(self):
         try:
-            for line in iter(self.proc.stdout.readline, ""):
-                cleaned = line.rstrip()
-                with self._lock:
-                    self.logs.append(cleaned)
-        except Exception:
-            pass
+            for line in self.proc.stdout:
+                with self.changed:
+                    self.logs.append(line.rstrip())
+                    self.changed.notify_all()
+        finally:
+            with self.changed:
+                self.changed.notify_all()
 
-    def send_cmd(self, cmd: str):
-        if self.proc and self.proc.poll() is None:
-            try:
-                self.proc.stdin.write(cmd + "\n")
-                self.proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
+    def checkpoint(self):
+        with self.changed:
+            return len(self.logs)
 
-    def get_logs(self) -> List[str]:
-        with self._lock:
-            return list(self.logs)
+    def wait_for(self, predicate, *, start=0, timeout=6):
+        with self.changed:
+            return self.changed.wait_for(lambda: any(predicate(line) for line in self.logs[start:]), timeout)
 
-    def is_alive(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+    def expect(self, text, *, start=0, timeout=6):
+        if not self.wait_for(lambda line: text in line, start=start, timeout=timeout):
+            raise AssertionError(f"{self.name} không hiển thị {text!r}")
+
+    def send(self, command):
+        self.proc.stdin.write(command + "\n")
+        self.proc.stdin.flush()
 
     def stop(self):
-        if self.proc and self.proc.poll() is None:
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
             try:
-                self.send_cmd("/quit")
-                self.proc.wait(timeout=2.0)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
+                self.send("/quit")
+                self.proc.wait(timeout=4)
+            except (OSError, subprocess.TimeoutExpired):
+                self.proc.kill()
+                self.proc.wait()
+        if self.reader is not None:
+            self.reader.join(timeout=2)
+        self.proc.stdin.close()
+        self.proc.stdout.close()
 
 
-def generate_test_file(filename: str, size: int) -> str:
-    """Tạo file nhị phân ngẫu nhiên và trả về mã băm SHA-256."""
-    print(f"{CYAN}[+] Đang khởi tạo tệp nhị phân ngẫu nhiên {size // (1024*1024)}MB: '{filename}'...{RESET}")
-    data = os.urandom(size)
-    with open(filename, "wb") as f:
-        f.write(data)
-    sha256_hash = hashlib.sha256(data).hexdigest()
-    print(f"{CYAN}[+] Mã băm SHA-256 gốc: {sha256_hash}{RESET}")
-    return sha256_hash
+def _test_ports():
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as first,
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as second,
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp,
+    ):
+        for sock in (first, second, udp):
+            sock.bind(("127.0.0.1", 0))
+        return first.getsockname()[1], second.getsockname()[1], udp.getsockname()[1]
 
 
-def verify_file_hash(filepath: str, expected_hash: str) -> bool:
-    """Xác minh mã băm SHA-256 của file."""
-    if not os.path.exists(filepath):
-        return False
-    h = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
-    return h.hexdigest() == expected_hash
+def _run_loopback_peer(udp_port):
+    """Giới hạn socket của test peer, giữ nguyên cấu hình của ứng dụng khi chạy bình thường."""
+    import main
+    import udp_handler
+
+    class LoopbackSocket(socket.socket):
+        def bind(self, address):
+            if self.family == socket.AF_INET:
+                host, port = address
+                if not host and self.type == socket.SOCK_DGRAM and port != 0:
+                    host = "127.255.255.255"
+                address = (host or "127.0.0.1", port)
+                if not address[0].startswith("127."):
+                    raise ValueError("Test chỉ cho phép bind IPv4 loopback.")
+            return super().bind(address)
+
+        def connect(self, address):
+            if self.family == socket.AF_INET and not address[0].startswith("127."):
+                raise ValueError("Test chỉ cho phép kết nối IPv4 loopback.")
+            return super().connect(address)
+
+        def connect_ex(self, address):
+            if self.family == socket.AF_INET and not address[0].startswith("127."):
+                raise ValueError("Test chỉ cho phép kết nối IPv4 loopback.")
+            return super().connect_ex(address)
+
+        def sendto(self, data, address):
+            if self.family == socket.AF_INET and not address[0].startswith("127."):
+                raise ValueError("Test chỉ cho phép gửi UDP tới IPv4 loopback.")
+            return super().sendto(data, address)
+
+    socket.socket = LoopbackSocket
+    udp_handler.UDP_PORT = udp_port
+    udp_handler.UDP_BROADCAST_ADDR = udp_handler.UDP_LOOPBACK_ADDR
+    main.UDP_PORT = udp_port
+    main.get_local_ip = lambda: "127.0.0.1"
+    main.main()
 
 
 def run_tests():
-    print(f"\n{BOLD}═════════════════════════════════════════════════════════════════{RESET}")
-    print(f"{BOLD}   KHỞI ĐỘNG HỆ THỐNG KIỂM THỬ TỰ ĐỘNG: LAN CHAT & FILE P2P   {RESET}")
-    print(f"{BOLD}═════════════════════════════════════════════════════════════════{RESET}\n")
+    with TemporaryDirectory(prefix="lan-chat-test-") as directory:
+        root = Path(directory)
+        quan_port, minh_port, udp_port = _test_ports()
+        quan = ProcessMonitor("Quan", quan_port, udp_port, root / "quan")
+        minh = ProcessMonitor("Minh", minh_port, udp_port, root / "minh")
+        for peer in (quan, minh):
+            peer.directory.mkdir()
 
-    # 1. Chuẩn bị file nhị phân 5MB
-    orig_hash = generate_test_file(TEST_FILENAME, TEST_FILE_SIZE)
+        source = quan.directory / "test_data.bin"
+        source.write_bytes(os.urandom(TEST_FILE_SIZE))
+        sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
 
-    # 2. Xóa các file test cũ trong downloads/ nếu có
-    downloaded_target = os.path.join(DOWNLOADS_DIR, TEST_FILENAME)
-    if os.path.exists(downloaded_target):
+        def discovery():
+            quan.expect("Minh (127.0.0.1:", timeout=10)
+            start = quan.checkpoint()
+            quan.send("/list")
+            quan.expect(f"1. Minh (127.0.0.1:{minh_port})", start=start)
+
+        def status():
+            start = minh.checkpoint()
+            minh.send("/status away")
+            minh.expect("Đã cập nhật trạng thái cá nhân: 'away'", start=start)
+            for _ in range(10):
+                start = quan.checkpoint()
+                quan.send("/list")
+                if quan.wait_for(
+                    lambda line: f"Minh (127.0.0.1:{minh_port})" in line and "away" in line,
+                    start=start, timeout=0.5,
+                ):
+                    return
+            raise AssertionError("Quan chưa thấy trạng thái away của Minh")
+
+        def chat():
+            start = quan.checkpoint()
+            quan.send("/chat 1")
+            quan.expect("Đã kết nối với Minh", start=start)
+            start = minh.checkpoint()
+            quan.send("Chào Minh từ Quan | UTF-8")
+            minh.expect("Chào Minh từ Quan | UTF-8", start=start)
+
+        def broadcast():
+            start = minh.checkpoint()
+            quan.send("/broadcast kiểm tra worker")
+            minh.expect("[Broadcast] kiểm tra worker", start=start)
+
+        def file_transfer():
+            start_sender = quan.checkpoint()
+            start_receiver = minh.checkpoint()
+            quan.send(f"/send {source}")
+            quan.send("Tin nhắn trong lúc gửi file")
+            minh.expect("Tin nhắn trong lúc gửi file", start=start_receiver)
+            quan.expect("Minh đã xác nhận lưu file 'test_data.bin'", start=start_sender, timeout=15)
+            target = minh.directory / "downloads" / source.name
+            if hashlib.sha256(target.read_bytes()).hexdigest() != sha256:
+                raise AssertionError("SHA-256 của file nhận không khớp")
+
+        def quota():
+            filename = "quota.bin"
+            declared_size = TEST_QUOTA_GIB * 1024**3 + 1
+            expected = b"FILE_ACK|1|ERROR|"
+            with socket.create_connection(("127.0.0.1", minh.port), timeout=3) as conn:
+                conn.sendall(f"FILE|{filename}|{declared_size}|".encode("ascii"))
+                with conn.makefile("rb") as reply:
+                    if reply.read(len(expected)) != expected:
+                        raise AssertionError("Receiver chưa từ chối file vượt quota trước khi đọc payload")
+            downloads = minh.directory / "downloads"
+            if (downloads / filename).exists() or list(downloads.glob("*.part")):
+                raise AssertionError("Lượt nhận bị từ chối để lại file")
+
+        def invalid_header():
+            with socket.create_connection(("127.0.0.1", minh.port), timeout=3) as conn:
+                conn.sendall(b"INVALID_HEADER|")
+            start = minh.checkpoint()
+            minh.send("/help")
+            minh.expect("Lệnh Discovery", start=start)
+
+        def disconnect():
+            start = minh.checkpoint()
+            quan.proc.terminate()
+            quan.proc.wait(timeout=3)
+            minh.expect("Kết nối với Quan đã bị ngắt", start=start)
+
+        def graceful_shutdown():
+            minh.send("/quit")
+            if minh.proc.wait(timeout=8) != 0:
+                raise AssertionError("Peer thoát với exit code khác 0")
+            saved = json.loads((minh.directory / "chat_history.json").read_text(encoding="utf-8"))
+            if not any("Chào Minh từ Quan | UTF-8" in entry for messages in saved.values() for entry in messages):
+                raise AssertionError("History sau /quit thiếu tin nhắn đã nhận")
+
+        tests = (
+            ("UDP discovery và /list", discovery),
+            ("Cập nhật UDP away", status),
+            ("TCP chat theo số và UTF-8", chat),
+            ("Broadcast qua worker riêng", broadcast),
+            ("Truyền file, ACK và SHA-256", file_transfer),
+            ("Quota downloads từ chối trước payload", quota),
+            ("Từ chối header không hợp lệ", invalid_header),
+            ("Abrupt disconnect", disconnect),
+            ("Graceful shutdown và history", graceful_shutdown),
+        )
+        failed = False
         try:
-            os.remove(downloaded_target)
-        except OSError:
-            pass
-
-    test_results: List[Tuple[str, str, str]] = []
-
-    peer_a = ProcessMonitor("Quan", 5001)
-    peer_b = ProcessMonitor("Minh", 5002)
-
-    try:
-        # Khởi chạy 2 peer
-        print(f"{CYAN}[*] Khởi chạy Peer A (Quan - Cổng 5001)...{RESET}")
-        peer_a.start()
-        print(f"{CYAN}[*] Khởi chạy Peer B (Minh - Cổng 5002)...{RESET}")
-        peer_b.start()
-
-        # -------------------------------------------------------------
-        # TC1 - UDP Discovery
-        # -------------------------------------------------------------
-        print(f"\n{BOLD}--- [TC1] Kiểm tra UDP Discovery tự động ---{RESET}")
-        print("Đang chờ 4.0s để 2 peer phát hiện nhau qua broadcast UDP...")
-        time.sleep(4.0)
-
-        peer_a.send_cmd("/list")
-        time.sleep(1.5)
-        logs_a = peer_a.get_logs()
-
-        tc1_passed = any("Minh" in line and "5002" in line for line in logs_a)
-        if tc1_passed:
-            print(f"{GREEN}[PASS] TC1: Peer A đã phát hiện Peer B (Minh:5002) qua UDP.{RESET}")
-            test_results.append(("TC1 - UDP Discovery", "PASS", "Phát hiện đúng peer Minh:5002 trong danh sách /list"))
-        else:
-            print(f"{RED}[FAIL] TC1: Không tìm thấy Minh:5002 trong danh sách /list của Peer A.{RESET}")
-            test_results.append(("TC1 - UDP Discovery", "FAIL", "Không thấy thông tin Minh:5002"))
-
-        # -------------------------------------------------------------
-        # TC2 - Trạng thái UDP (away)
-        # -------------------------------------------------------------
-        print(f"\n{BOLD}--- [TC2] Kiểm tra cập nhật trạng thái UDP (/status away) ---{RESET}")
-        peer_b.send_cmd("/status away")
-        print("Đã gửi lệnh đổi trạng thái sang 'away' tại Peer B. Chờ chu kỳ broadcast 3.5s...")
-        time.sleep(3.5)
-
-        peer_a.send_cmd("/list")
-        time.sleep(1.5)
-        logs_a = peer_a.get_logs()
-
-        tc2_passed = any("Minh" in line and "away" in line for line in logs_a)
-        if tc2_passed:
-            print(f"{GREEN}[PASS] TC2: Trạng thái của Minh đã chuyển thành 'away' trên máy Peer A.{RESET}")
-            test_results.append(("TC2 - UDP Status Sync", "PASS", "Đồng bộ trạng thái 'away' thành công qua UDP"))
-        else:
-            print(f"{RED}[FAIL] TC2: Trạng thái 'away' chưa được đồng bộ sang Peer A.{RESET}")
-            test_results.append(("TC2 - UDP Status Sync", "FAIL", "Trạng thái không đổi sang away"))
-
-        # -------------------------------------------------------------
-        # TC3 - TCP Chat
-        # -------------------------------------------------------------
-        print(f"\n{BOLD}--- [TC3] Kiểm tra gửi nhận tin nhắn TCP 1-1 ---{RESET}")
-        peer_a.send_cmd("/chat Minh")
-        time.sleep(1.0)
-
-        chat_msg = "Hello Minh from Quan! Test message 12345"
-        peer_a.send_cmd(chat_msg)
-        time.sleep(1.5)
-
-        logs_b = peer_b.get_logs()
-        tc3_passed = any(chat_msg in line for line in logs_b)
-        if tc3_passed:
-            print(f"{GREEN}[PASS] TC3: Peer B đã nhận chính xác nội dung tin nhắn chat từ Peer A.{RESET}")
-            test_results.append(("TC3 - TCP Chat 1-1", "PASS", f"Tin nhắn '{chat_msg}' được nhận đúng 100%"))
-        else:
-            print(f"{RED}[FAIL] TC3: Tin nhắn không xuất hiện tại Peer B.{RESET}")
-            test_results.append(("TC3 - TCP Chat 1-1", "FAIL", "Không nhận được tin nhắn chat"))
-
-        # -------------------------------------------------------------
-        # TC4 - Truyền File & Toàn vẹn dữ liệu SHA-256
-        # -------------------------------------------------------------
-        print(f"\n{BOLD}--- [TC4] Kiểm tra truyền file nhị phân 5MB & Kiểm tra mã băm SHA-256 ---{RESET}")
-        # Gửi lệnh /send test_data.bin từ Peer A
-        peer_a.send_cmd(f"/send {TEST_FILENAME}")
-        print("Đang truyền tệp tin nhị phân 5MB qua kết nối TCP riêng...")
-
-        # Đợi tối đa 10s cho file 5MB truyền xong
-        file_received = False
-        target_file_path = os.path.join(DOWNLOADS_DIR, TEST_FILENAME)
-        for _ in range(20):
-            time.sleep(0.5)
-            if os.path.exists(target_file_path) and os.path.getsize(target_file_path) == TEST_FILE_SIZE:
-                file_received = True
-                break
-
-        if file_received:
-            print(f"{CYAN}[*] File đã được tải xong tại '{target_file_path}'. Đang tính toán mã băm SHA-256...{RESET}")
-            hash_match = verify_file_hash(target_file_path, orig_hash)
-            if hash_match:
-                print(f"{GREEN}[PASS] TC4: File 5MB truyền thành công, mã băm SHA-256 trùng khớp 100%!{RESET}")
-                test_results.append(("TC4 - File Transfer & SHA256", "PASS", "Dữ liệu nhị phân 5MB toàn vẹn tuyệt đối"))
-            else:
-                print(f"{RED}[FAIL] TC4: File nhận được bị sai lệch dữ liệu (mã băm không khớp)!{RESET}")
-                test_results.append(("TC4 - File Transfer & SHA256", "FAIL", "Mã băm SHA-256 không khớp"))
-        else:
-            print(f"{RED}[FAIL] TC4: Không tìm thấy file hoàn chỉnh trong thư mục downloads/.{RESET}")
-            test_results.append(("TC4 - File Transfer & SHA256", "FAIL", "Không nhận đủ 5MB hoặc file không tồn tại"))
-
-        # -------------------------------------------------------------
-        # TC5 - Chống crash gói rác (Malformed Packet)
-        # -------------------------------------------------------------
-        print(f"\n{BOLD}--- [TC5] Kiểm tra khả năng chống crash do gói tin rác (Malformed Packet) ---{RESET}")
-        try:
-            raw_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            raw_s.settimeout(3.0)
-            raw_s.connect(("127.0.0.1", 5002))
-            raw_s.sendall(b"INVALID_HEADER_GARBAGE_12345\n")
-            time.sleep(0.5)
-            raw_s.close()
-            time.sleep(1.0)
-
-            # Kiểm tra xem Peer B có còn sống không
-            if peer_b.is_alive():
-                # Gửi thêm lệnh kiểm tra Peer B vẫn phản hồi bình thường
-                peer_b.send_cmd("/help")
-                time.sleep(0.5)
-                print(f"{GREEN}[PASS] TC5: Gói tin rác bị từ chối an toàn, tiến trình Peer B tiếp tục sống khỏe mạnh.{RESET}")
-                test_results.append(("TC5 - Malformed Packet", "PASS", "Server chặn rác an toàn, không bị crash"))
-            else:
-                print(f"{RED}[FAIL] TC5: Tiến trình Peer B đã bị crash sau khi nhận gói tin rác!{RESET}")
-                test_results.append(("TC5 - Malformed Packet", "FAIL", "Tiến trình bị sập"))
-        except Exception as e:
-            print(f"{RED}[FAIL] TC5: Lỗi khi thực hiện gửi gói tin rác: {e}{RESET}")
-            test_results.append(("TC5 - Malformed Packet", "FAIL", str(e)))
-
-        # -------------------------------------------------------------
-        # TC6 - Ngắt kết nối đột ngột
-        # -------------------------------------------------------------
-        print(f"\n{BOLD}--- [TC6] Kiểm tra xử lý khi đối tác ngắt kết nối đột ngột ---{RESET}")
-        print("Đang dừng cưỡng bức (terminate) tiến trình Peer A...")
-        if peer_a.proc:
-            peer_a.proc.terminate()
-            peer_a.proc.wait(timeout=2.0)
-
-        time.sleep(2.0)
-        logs_b = peer_b.get_logs()
-        # Kiểm tra Peer B có in thông báo ngắt kết nối an toàn không
-        disconnect_notified = any("Kết nối với Quan đã bị ngắt" in line for line in logs_b)
-        peer_b_alive = peer_b.is_alive()
-
-        if disconnect_notified and peer_b_alive:
-            print(f"{GREEN}[PASS] TC6: Peer B phát hiện ngắt kết nối an toàn, in thông báo chuẩn và không bị crash.{RESET}")
-            test_results.append(("TC6 - Abrupt Disconnect", "PASS", "Bắt ngoại lệ ngắt kết nối an toàn, prompt trở về bình thường"))
-        else:
-            status_desc = "Không in thông báo" if not disconnect_notified else "Peer B bị crash"
-            print(f"{RED}[FAIL] TC6: {status_desc}.{RESET}")
-            test_results.append(("TC6 - Abrupt Disconnect", "FAIL", status_desc))
-
-    finally:
-        # Dọn dẹp tiến trình
-        print(f"\n{CYAN}[*] Đang dừng toàn bộ tiến trình peer...{RESET}")
-        peer_a.stop()
-        peer_b.stop()
-
-        # Dọn dẹp file test
-        print(f"{CYAN}[*] Đang dọn dẹp các tệp tin kiểm thử tạm thời...{RESET}")
-        if os.path.exists(TEST_FILENAME):
-            try:
-                os.remove(TEST_FILENAME)
-            except OSError:
-                pass
-
-        if os.path.exists(downloaded_target):
-            try:
-                os.remove(downloaded_target)
-            except OSError:
-                pass
-
-    # -------------------------------------------------------------
-    # BẢNG TỔNG KẾT ĐÁNH GIÁ (TEST SUMMARY REPORT)
-    # -------------------------------------------------------------
-    print(f"\n{BOLD}═══════════════════════════════════════════════════════════════════════════════════{RESET}")
-    print(f"{BOLD}                        BẢNG TỔNG KẾT ĐÁNH GIÁ KIỂM THỬ TỰ ĐỘNG                     {RESET}")
-    print(f"{BOLD}═══════════════════════════════════════════════════════════════════════════════════{RESET}")
-    print(f"{BOLD}| {'Mã Test Case':<30} | {'Kết quả':<10} | {'Chi tiết đánh giá':<32} |{RESET}")
-    print(f"|{'-'*32}|{'-'*12}|{'-'*34}|")
-
-    all_passed = True
-    for name, status, detail in test_results:
-        status_colored = f"{GREEN}{status:<8}{RESET}" if status == "PASS" else f"{RED}{status:<8}{RESET}"
-        if status != "PASS":
-            all_passed = False
-        print(f"| {name:<30} | {status_colored} | {detail:<32} |")
-
-    print(f"═══════════════════════════════════════════════════════════════════════════════════\n")
-
-    if all_passed:
-        print(f"{GREEN}{BOLD}>>> KẾT QUẢ CUỐI CÙNG: 6/6 TEST CASES ĐẠT CHUẨN (100% PASS) <<<{RESET}\n")
-    else:
-        print(f"{RED}{BOLD}>>> KẾT QUẢ CUỐI CÙNG: MỘT SỐ TEST CASE CHƯA ĐẠT. VUI LÒNG KIỂM TRA LẠI LOG. <<<{RESET}\n")
+            for peer in (quan, minh):
+                peer.start()
+                peer.expect("Hệ thống UDP Discovery đã sẵn sàng", timeout=10)
+            for title, test in tests:
+                try:
+                    test()
+                except (AssertionError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+                    failed = True
+                    print(f"[FAIL] {title} — {e}")
+                else:
+                    print(f"[PASS] {title}")
+        except (AssertionError, OSError) as e:
+            failed = True
+            print(f"[FAIL] Khởi động test peers — {e}")
+        finally:
+            for peer in (quan, minh):
+                peer.stop()
+                if failed:
+                    print(f"--- Log gần nhất của {peer.name} ---")
+                    print("\n".join(peer.logs[-20:]))
+        return int(failed)
 
 
 if __name__ == "__main__":
-    run_tests()
-
+    if sys.argv[1:2] == ["--peer"]:
+        port = int(sys.argv[2])
+        del sys.argv[1:3]
+        _run_loopback_peer(port)
+    else:
+        raise SystemExit(run_tests())

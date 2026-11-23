@@ -7,10 +7,10 @@
 ║          LAN Chat & File Sharing P2P             ║
 ╚══════════════════════════════════════════════════╝
 
-[Quan|available]> /chat Minh
+[Quan|online]> /chat Minh
 [OK]  Đang chat với Minh.
 
-[Quan|available → Minh]> Chào Minh!
+[Quan|online → Minh]> Chào Minh!
 [Quan (bạn)] Chào Minh!
 
 *** [Minh] Chào Quan! ***
@@ -24,11 +24,11 @@
 |---|---|
 | 🔍 **UDP Discovery** | Tự động tìm thấy các máy khác trong LAN sau ~3 giây, không cần nhập IP thủ công |
 | 💬 **Chat 1-1** | Nhắn tin real-time với bất kỳ peer nào đang online |
-| 📢 **Broadcast** | Gửi thông báo đến toàn bộ peer online cùng lúc |
-| 📁 **Gửi file** | Chuyển file qua kết nối TCP riêng biệt (không làm gián đoạn chat) |
+| 📢 **Broadcast** | Gửi thông báo đến toàn bộ peer online |
+| 📁 **Gửi file** | Chuyển file qua TCP connection riêng trên background worker. Có thể tiếp tục chat trong lúc gửi. |
 | 📊 **File progress** | Thanh tiến độ `[████░░░░] 50%` khi gửi file lớn |
 | 💾 **Persistent history** | Lịch sử chat được lưu tự động vào `chat_history.json`, đọc lại sau khi restart |
-| 🔄 **Auto-reconnect** | Tự động kết nối lại với người đang chat khi mất kết nối tạm thời |
+| 🔄 **Auto-reconnect** | Thử kết nối lại với peer đã chọn khi peer vẫn còn trong UDP peer table. |
 | ⌨️ **Tab Autocomplete** | Nhấn Tab để gợi ý lệnh, tên peer, đường dẫn file |
 | 🎨 **Colored UI** | Giao diện màu sắc, input không bị đè bởi tin nhắn đến |
 | 🔌 **Multi-instance** | Test nhiều người trên cùng 1 máy với các `--port` khác nhau |
@@ -62,16 +62,18 @@
 **Protocol tự thiết kế:**
 ```
 UDP:  HELLO|<name>|<tcp_port>|<status>
-TCP:  HELLO|<name>|<tcp_port>|<CHAT|FILE>|
+      HELLO2|<name>|<tcp_port>|<status>|<instance_id>
+TCP:  HELLO|<name>|<tcp_port>|<CHAT hoặc FILE>|
       MSG|<length>|<content bytes>
       FILE|<filename>|<size>|<data bytes>
+      FILE_ACK|1|<OK hoặc ERROR>|
 ```
 
 ---
 
 ## 📋 Yêu cầu
 
-- **Python** 3.10 trở lên (dùng tính năng `match`, `X | Y` type hint)
+- **Python** 3.10 trở lên
 - **prompt_toolkit** ≥ 3.0.0
 - **Kết nối mạng LAN** (hoặc loopback để test trên 1 máy)
 
@@ -85,20 +87,15 @@ TCP:  HELLO|<name>|<tcp_port>|<CHAT|FILE>|
 # Clone hoặc copy thư mục dự án
 cd lan_chat
 
-# Cài thư viện (Arch Linux / Manjaro)
-pip install prompt_toolkit --break-system-packages
-
-# Các distro khác (Ubuntu, Fedora...)
-pip3 install prompt_toolkit
-# Hoặc dùng venv:
-python3 -m venv .venv && source .venv/bin/activate && pip install prompt_toolkit
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 
 # Chạy
 python3 main.py --name Quan --port 5001
 ```
 
-> **Lưu ý Linux:** Cần quyền gửi UDP broadcast. Thông thường không cần `sudo`.  
-> Nếu bị `Permission denied`, chạy: `sudo python3 main.py --name Quan --port 5001`
+> Nếu discovery lỗi, kiểm tra UDP 9999, TCP port đã chọn và cấu hình firewall của mạng LAN.
 
 ---
 
@@ -107,16 +104,15 @@ python3 main.py --name Quan --port 5001
 ```bash
 cd lan_chat
 
-# Cài thư viện
-pip3 install prompt_toolkit
-# Hoặc nếu dùng Homebrew Python:
-python3 -m pip install prompt_toolkit
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 
 # Chạy
 python3 main.py --name Quan --port 5001
 ```
 
-> **Lưu ý macOS:** `SO_REUSEPORT` được hỗ trợ đầy đủ. Test nhiều instance trên cùng máy hoạt động bình thường.
+> Nếu nhiều instance trên một máy không nhận được UDP broadcast, thử trên hai máy trong cùng LAN.
 
 ---
 
@@ -126,11 +122,11 @@ python3 main.py --name Quan --port 5001
 # Mở PowerShell hoặc Command Prompt
 cd lan_chat
 
-# Cài thư viện
-pip install prompt_toolkit
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
 
 # Chạy
-python main.py --name Quan --port 5001
+.\.venv\Scripts\python main.py --name Quan --port 5001
 ```
 
 > **⚠️ Lưu ý quan trọng trên Windows:**
@@ -146,13 +142,13 @@ python main.py --name Quan --port 5001
 
 ```bash
 # Terminal 1
-python3 main.py --name Quan --port 5001
+python3 main.py --name Quan --port 5001 --data-dir ./data-quan
 
 # Terminal 2
-python3 main.py --name Minh --port 5002
+python3 main.py --name Minh --port 5002 --data-dir ./data-minh
 
 # Terminal 3 (tùy chọn)
-python3 main.py --name An --port 5003
+python3 main.py --name An --port 5003 --data-dir ./data-an
 ```
 
 ---
@@ -162,13 +158,15 @@ python3 main.py --name An --port 5003
 ### Tham số khởi động
 
 ```
-python3 main.py --name <tên> --port <port> [--debug]
+python3 main.py --name <tên> --port <port> [--data-dir <thư mục>] [--download-quota-gib <GiB>] [--debug]
 ```
 
 | Tham số | Mô tả | Ví dụ |
 |---|---|---|
 | `--name` | Tên hiển thị của bạn | `--name Quan` |
-| `--port` | TCP port lắng nghe (1024–65535) | `--port 5001` |
+| `--port` | TCP port lắng nghe (1–65535) | `--port 5001` |
+| `--data-dir` | Thư mục history và downloads, mặc định là working directory | `--data-dir ./data-quan` |
+| `--download-quota-gib` | Quota file nhận tính bằng GiB, mặc định 8 | `--download-quota-gib 16` |
 | `--debug` | Bật log chi tiết (socket, thread) | `--debug` |
 
 ---
@@ -178,14 +176,14 @@ python3 main.py --name <tên> --port <port> [--debug]
 ```
 ┌─ Discovery ───────────────────────────────────────────┐
 │  /list              Hiển thị peer đang online          │
-│  /status <s>        Đổi trạng thái (available|busy)   │
+│  /status <s>        Đổi trạng thái (online|away)      │
 ├─ Chat 1-1 ────────────────────────────────────────────┤
-│  /chat <tên>        Kết nối và bắt đầu chat            │
-│  /send <tin nhắn>   Gửi tin (hoặc gõ thẳng không /send)│
+│  /chat <tên|số>     Kết nối và bắt đầu chat            │
+│  Nhập nội dung      Gửi tin đến peer hiện tại         │
 │  /history           Xem lại lịch sử chat               │
 │  /leave             Rời chat, giữ kết nối TCP          │
 ├─ Gửi File ────────────────────────────────────────────┤
-│  /file <đường dẫn>  Gửi file đến peer hiện tại        │
+│  /send <đường dẫn>  Gửi file (/file là alias)          │
 ├─ Broadcast ───────────────────────────────────────────┤
 │  /broadcast <msg>   Gửi tin đến TẤT CẢ peer online    │
 ├─ Chung ───────────────────────────────────────────────┤
@@ -203,11 +201,30 @@ Nhấn `Tab` sau khi gõ một phần lệnh:
 | `/ch` | Tab | `/chat` |
 | `/chat ` | Tab | Danh sách tên tất cả peer online |
 | `/chat Mi` | Tab | `Minh` (peer tên bắt đầu bằng Mi) |
-| `/status ` | Tab | `available` / `busy` |
-| `/file ./` | Tab | Danh sách file trong thư mục hiện tại |
+| `/status ` | Tab | `online` / `away` |
+| `/send ./` | Tab | Danh sách file trong thư mục hiện tại |
 | `/br` | Tab | `/broadcast` |
 
 Dùng `↑` `↓` để duyệt lịch sử lệnh đã gõ.
+
+`/chat <số>` dùng số trong lần `/list` gần nhất. Trạng thái `online` được gửi trên UDP với giá trị `available` để peer cũ đọc được. Peer mới gửi cả `HELLO` và `HELLO2` trong mỗi chu kỳ discovery. `HELLO2` chứa UUID để gộp các địa chỉ cùng peer.
+
+Mỗi instance gửi một file tại một thời điểm, tối đa 2 GiB mỗi file. Receiver lưu vào `downloads/` trong data directory và dùng hard link để publish cùng filesystem. Nếu peer đóng connection khi chưa gửi ACK được hỗ trợ, sender báo chưa xác nhận lưu file.
+
+Quota tính file thường hiện có trực tiếp trong `downloads/` và kích thước đã đặt trước cho các lượt nhận cùng instance. Khi vượt quota hoặc thiếu dung lượng trống, ứng dụng từ chối lượt nhận mới. Dùng `--data-dir` riêng cho từng instance để mỗi instance quản lý reservation riêng.
+
+TCP chat có deadline ghi 10 giây cho mỗi frame. `/broadcast` chạy trên queue riêng, tối đa 8 lệnh đang chờ. Khi thoát, ứng dụng chờ tối đa 2 giây cho lần lưu history cuối, rồi cảnh báo nếu chưa nhận được kết quả.
+
+## Kiểm thử
+
+```bash
+python3 -B -m unittest discover -s tests -v
+python3 -B run_auto_test.py
+```
+
+Unit tests bao gồm socket ownership, giới hạn framing, timeout, hủy transfer, storage, command parsing và prompt redraw. Smoke test chạy hai subprocess trên IPv4 loopback với cổng động và thư mục tạm riêng. Các kịch bản có broadcast, kiểm tra SHA-256, từ chối khi vượt quota và lưu history sau `/quit`. Script trả exit code khác 0 khi có lỗi.
+
+Để demo trên hai máy, chạy hai instance cùng LAN, thử discovery, trạng thái, tin nhắn và gửi file khi đang chat. Trong Wireshark, lọc `udp.port == 9999` rồi chọn TCP stream để xác nhận SYN, SYN-ACK, ACK và application HELLO.
 
 ---
 
@@ -235,14 +252,9 @@ lan_chat/
 ### ❌ `ModuleNotFoundError: No module named 'prompt_toolkit'`
 
 ```bash
-# Linux (Arch)
-pip install prompt_toolkit --break-system-packages
-
-# Tất cả OS — dùng venv
 python3 -m venv .venv
 source .venv/bin/activate        # Linux/macOS
-.venv\Scripts\activate           # Windows
-pip install prompt_toolkit
+python3 -m pip install -r requirements.txt
 python3 main.py --name Quan --port 5001
 ```
 
@@ -265,12 +277,12 @@ python3 main.py --name Quan --port 5010
 
 ### ❌ Gửi tin thất bại sau khi peer restart
 
-Auto-reconnect sẽ tự phục hồi trong vòng **15 giây**. Hoặc gõ `/chat <tên>` lại thủ công.
+Worker thử lại theo chu kỳ 15 giây khi peer đã chọn vẫn còn online. Nếu peer đã hết UDP timeout, đợi peer xuất hiện lại trong `/list` rồi gõ `/chat <tên|số>`. `/leave` hủy retry và giữ TCP connection đã mở.
 
 ### ❌ File không nhận được
 
-- Kiểm tra thư mục `downloads/` trong thư mục chạy lệnh.
-- Đảm bảo đã `/chat <tên>` trước khi `/file`.
+- Kiểm tra `downloads/` trong data directory và thông báo xác nhận phía gửi.
+- Dùng `/chat <tên|số>` trước khi `/send <tệp>`.
 - Trên Windows: cho phép Python qua Windows Defender Firewall.
 
 ---

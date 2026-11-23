@@ -8,10 +8,18 @@ Mục đích:
 - Tương thích đa nền tảng: Linux & Windows.
 """
 
+import socket
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
+
+from protocol import PEER_TIMEOUT
+
+DEFAULT_DOWNLOAD_QUOTA_GIB = 8
+GIB = 1024**3
 
 
 # ---------------------------------------------------------------------------
@@ -28,17 +36,19 @@ class Peer:
         ip:        Địa chỉ IP của peer.
         tcp_port:  Port TCP mà peer lắng nghe kết nối.
         status:    Trạng thái: "available" | "busy".
-        last_seen: Timestamp (time.time()) lần cuối nhận HELLO.
+        last_seen: Thời điểm monotonic nhận HELLO gần nhất.
     """
     name: str
     ip: str
     tcp_port: int
     status: str = "available"
-    last_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=lambda: time.monotonic())
+    endpoint_seen: float = field(default_factory=lambda: time.monotonic())
+    instance_id: Optional[str] = None
 
-    def is_timed_out(self, timeout_sec: float = 10.0) -> bool:
+    def is_timed_out(self, timeout_sec: float = PEER_TIMEOUT) -> bool:
         """Kiểm tra peer đã quá thời gian chờ (10s không gửi HELLO) hay chưa."""
-        return (time.time() - self.last_seen) > timeout_sec
+        return time.monotonic() - self.last_seen >= timeout_sec
 
     def __str__(self) -> str:
         status_icon = "🟢" if self.status == "available" else ("🟡" if self.status == "away" else "🔴")
@@ -48,6 +58,13 @@ class Peer:
 # ---------------------------------------------------------------------------
 # Shared State - Singleton Thread-safe
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ChatConnection:
+    sock: socket.socket
+    outgoing: bool
+    write_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+
 
 class SharedState:
     """
@@ -61,12 +78,20 @@ class SharedState:
         self.my_tcp_port: int = 0
         self.my_ip: str = ""
         self.my_status: str = "available"
+        self.instance_id = uuid4().hex
+        self.data_dir = Path(".")
+        self.download_quota_bytes = DEFAULT_DOWNLOAD_QUOTA_GIB * GIB
+        self.history_writable = True
 
         # Danh sách peer online: key = "ip:tcp_port", value = Peer
         self.peer_list: Dict[str, Peer] = {}
+        self.peer_instances: Dict[str, str] = {}
+        self.peer_endpoints: Dict[str, Tuple[str, float]] = {}
+        self.listed_peer_keys: tuple[str, ...] = ()
 
         # Khóa của partner hiện đang chat cùng (hoặc None nếu đang ở màn hình ngoài)
         self.current_partner: Optional[str] = None
+        self.reconnect_partner: Optional[str] = None
 
         # Lock bảo vệ peer_list, chat_history, unread_counts
         self.lock: threading.Lock = threading.Lock()
@@ -76,13 +101,17 @@ class SharedState:
 
         # Số tin nhắn chưa đọc
         self.unread_counts: Dict[str, int] = {}
+        self.first_unread: Dict[str, int] = {}
 
         # Event báo hiệu dừng toàn bộ các luồng khi /quit
         self.stop_event: threading.Event = threading.Event()
 
         # Quản lý kết nối TCP (giữ kết nối để tái sử dụng)
         # conn_lock tách rời để tránh contention/deadlock với data lock
-        self.connections: Dict[str, Any] = {}
+        self.connections: Dict[str, ChatConnection] = {}
+        self.pending_chat_dials: Dict[str, threading.Event] = {}
+        self.dialing_chat_sockets: set[socket.socket] = set()
+        self.tcp_workers: Dict[socket.socket, Tuple[threading.Thread, bool]] = {}
         self.conn_lock: threading.Lock = threading.Lock()
 
     # --- Các hàm thao tác thread-safe ---
@@ -92,28 +121,56 @@ class SharedState:
         """Tạo khóa định danh duy nhất cho peer."""
         return f"{ip}:{tcp_port}"
 
-    def upsert_peer(self, name: str, ip: str, tcp_port: int, status: str) -> bool:
+    def resolve_peer_key(self, ip: str, tcp_port: int) -> str:
+        endpoint = self.get_peer_key(ip, tcp_port)
+        with self.lock:
+            key, _ = self.peer_endpoints.get(endpoint, (endpoint, 0.0))
+            return key
+
+    def upsert_peer(self, name: str, ip: str, tcp_port: int, status: str, instance_id: str | None = None) -> bool:
         """
         Cập nhật hoặc thêm mới peer.
         Trả về True nếu đây là peer mới tham gia mạng.
         """
-        key = self.get_peer_key(ip, tcp_port)
+        endpoint = self.get_peer_key(ip, tcp_port)
         with self.lock:
+            now = time.monotonic()
+            if instance_id is not None:
+                key = self.peer_instances.get(instance_id, endpoint)
+                previous = self.peer_list.get(key)
+                if previous and previous.instance_id not in (None, instance_id):
+                    self.peer_instances.pop(previous.instance_id, None)
+                    self.peer_endpoints = {
+                        addr: seen for addr, seen in self.peer_endpoints.items() if seen[0] != key
+                    }
+                self.peer_instances[instance_id] = key
+                self.peer_endpoints[endpoint] = (key, now)
+                legacy = self.peer_list.get(endpoint)
+                if key != endpoint and legacy is not None and legacy.instance_id is None:
+                    # Keep its history on disk under the original endpoint key.
+                    del self.peer_list[endpoint]
+            else:
+                key, _ = self.peer_endpoints.get(endpoint, (endpoint, now))
+                if endpoint in self.peer_endpoints:
+                    self.peer_endpoints[endpoint] = (key, now)
+
             is_new = key not in self.peer_list
             if is_new:
                 self.peer_list[key] = Peer(
-                    name=name, ip=ip, tcp_port=tcp_port, status=status
+                    name=name, ip=ip, tcp_port=tcp_port, status=status,
+                    last_seen=now, endpoint_seen=now, instance_id=instance_id,
                 )
-                # Chỉ khởi tạo nếu chưa có trong history (tránh ghi đè khi đã load từ JSON)
-                if key not in self.chat_history:
-                    self.chat_history[key] = []
-                if key not in self.unread_counts:
-                    self.unread_counts[key] = 0
             else:
                 peer = self.peer_list[key]
+                if instance_id is not None:
+                    peer.instance_id = instance_id
                 peer.name = name
                 peer.status = status
-                peer.last_seen = time.time()
+                peer.last_seen = now
+                if (peer.ip, peer.tcp_port) == (ip, tcp_port) or now - peer.endpoint_seen >= PEER_TIMEOUT:
+                    peer.ip = ip
+                    peer.tcp_port = tcp_port
+                    peer.endpoint_seen = now
             return is_new
 
     def remove_timed_out_peers(self) -> List[str]:
@@ -130,15 +187,24 @@ class SharedState:
                 peer = self.peer_list.pop(key, None)
                 if peer:
                     removed.append(peer.name)
+                    if peer.instance_id is not None:
+                        self.peer_instances.pop(peer.instance_id, None)
                 # Đưa về dấu nhắc chính nếu partner bị timeout
                 if self.current_partner == key:
                     self.current_partner = None
+                if self.reconnect_partner == key:
+                    self.reconnect_partner = None
+            now = time.monotonic()
+            self.peer_endpoints = {
+                addr: (key, last_seen) for addr, (key, last_seen) in self.peer_endpoints.items()
+                if key in self.peer_list and now - last_seen < PEER_TIMEOUT
+            }
         return removed
 
-    def get_peer_list_snapshot(self) -> List[Peer]:
-        """Lấy bản sao danh sách peer an toàn (shallow copy)."""
+    def get_peer_list_snapshot(self) -> Dict[str, Peer]:
+        """Lấy bản sao nhất quán của các peer để đọc ngoài lock."""
         with self.lock:
-            return list(self.peer_list.values())
+            return {key: replace(peer) for key, peer in self.peer_list.items()}
 
     def set_status(self, status: str):
         """Thay đổi trạng thái cá nhân (available | busy)."""
