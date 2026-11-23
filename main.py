@@ -11,11 +11,11 @@ Các tính năng nổi bật:
 import argparse
 import logging
 import os
-import queue
 import socket
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future
 from functools import partial
 from pathlib import Path
@@ -220,41 +220,79 @@ def _open_chat(peer_key: str, peer: Peer) -> bool:
 # Xử lý lệnh người dùng (Command Handler)
 # ---------------------------------------------------------------------------
 
-def _start_command_worker(name: str, capacity: int):
-    jobs: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=capacity)
+CHAT_QUEUE_BYTES = 32 * 1024**2
+BROADCAST_QUEUE_BYTES = 16 * 1024**2
 
-    def enqueue(job: Callable[[], None]) -> bool:
-        if state.stop_event.is_set():
-            return False
+
+class _CommandQueue:
+    def __init__(self, name: str, capacity: int, payload_budget: int, stop_event: threading.Event):
+        self.name = name
+        self._capacity = capacity
+        self._payload_budget = payload_budget
+        self._stop_event = stop_event
+        self._jobs: deque[tuple[Callable[[], None], int]] = deque()
+        self._in_flight_bytes = 0
+        self._ready = threading.Condition()
+
+    @property
+    def _reserved_bytes(self) -> int:
+        return self._in_flight_bytes + sum(size for _, size in self._jobs)
+
+    def enqueue(self, job: Callable[[], None], payload_bytes: int) -> bool:
+        with self._ready:
+            if (
+                self._stop_event.is_set() or len(self._jobs) >= self._capacity
+                or self._reserved_bytes + payload_bytes > self._payload_budget
+            ):
+                return False
+            self._jobs.append((job, payload_bytes))
+            self._ready.notify()
+            return True
+
+    def cancel_pending(self):
+        # The worker owns any job it has already taken from the queue.
+        with self._ready:
+            count = len(self._jobs)
+            self._jobs.clear()
+            self._ready.notify_all()
+        if count:
+            print_warning(f"Đã hủy {count} lệnh chưa chạy trên {self.name} khi đóng ứng dụng.")
+
+    def run(self):
         try:
-            jobs.put_nowait(job)
-        except queue.Full:
-            return False
-        return True
+            while True:
+                with self._ready:
+                    self._ready.wait_for(lambda: self._jobs or self._stop_event.is_set(), timeout=0.1)
+                    if self._stop_event.is_set():
+                        return
+                    if not self._jobs:
+                        continue
+                    job, payload_bytes = self._jobs.popleft()
+                    self._in_flight_bytes = payload_bytes
+                try:
+                    job()
+                except Exception:
+                    logger.exception("Lỗi khi xử lý lệnh trên %s.", self.name)
+                finally:
+                    del job
+                    with self._ready:
+                        self._in_flight_bytes = 0
+        finally:
+            self.cancel_pending()
 
-    def run():
-        while not state.stop_event.is_set():
-            try:
-                job = jobs.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if state.stop_event.is_set():
-                break
-            try:
-                job()
-            except Exception:
-                logger.exception("Lỗi khi xử lý lệnh trên %s.", name)
 
-    worker = threading.Thread(target=run, name=name, daemon=True)
+def _start_command_worker(name: str, capacity: int, payload_budget: int):
+    commands = _CommandQueue(name, capacity, payload_budget, state.stop_event)
+    worker = threading.Thread(target=commands.run, name=name, daemon=True)
     worker.start()
-    return worker, enqueue
+    return worker, commands.enqueue, commands.cancel_pending
 
 
 def _start_chat_worker():
-    worker, enqueue = _start_command_worker("Chat-Commands", 64)
+    worker, enqueue, cancel_pending = _start_command_worker("Chat-Commands", 64, CHAT_QUEUE_BYTES)
     pending_selection: Future[bool] | None = None
 
-    def submit(command: str, job: Callable[[], bool]) -> bool:
+    def submit(command: str, job: Callable[[], bool], payload_bytes: int) -> bool:
         nonlocal pending_selection
         selection = Future() if command == "/chat" else None
         depends_on = pending_selection if command in ("", "/send", "/file") else None
@@ -272,26 +310,25 @@ def _start_chat_worker():
                 if selection is not None:
                     selection.set_result(succeeded)
 
-        if not enqueue(execute):
+        if not enqueue(execute, payload_bytes):
             return False
         if selection is not None or command == "/leave":
             pending_selection = selection
         return True
 
-    return worker, submit
+    return worker, submit, cancel_pending
 
 
 BROADCAST_PREFIX = "[Broadcast] "
 
 
-def _message_fits_queue(text: str, prefix: str = "") -> bool:
-    limit = MAX_MSG_LEN - len(prefix)
-    if len(text) <= limit // 4:
-        return True
-    if len(text) <= limit and len(text.encode("utf-8", errors="replace")) <= limit:
-        return True
+def _message_payload_size(text: str, prefix_bytes: int = 0) -> int | None:
+    if len(text) + prefix_bytes <= MAX_MSG_LEN:
+        size = len(text) if text.isascii() else len(text.encode("utf-8", errors="replace"))
+        if size + prefix_bytes <= MAX_MSG_LEN:
+            return size + prefix_bytes
     print_warning(f"Tin nhắn vượt quá {MAX_MSG_LEN} bytes UTF-8.")
-    return False
+    return None
 
 
 def _broadcast_text(content: str):
@@ -305,6 +342,7 @@ def _broadcast_text(content: str):
     timestamp = time.strftime("%H:%M:%S")
     for key in peers:
         if state.stop_event.is_set():
+            print_warning(f"Đã dừng broadcast khi đóng ứng dụng. Đã gửi tới {success_count}/{len(peers)} người dùng.")
             return
         try:
             sent = send_chat_message(key, BROADCAST_PREFIX + content)
@@ -322,8 +360,8 @@ def _broadcast_text(content: str):
 
 def handle_command(
     cmd_raw: str,
-    submit_chat: Callable[[str, Callable[[], bool]], bool] | None = None,
-    submit_broadcast: Callable[[Callable[[], None]], bool] | None = None,
+    submit_chat: Callable[[str, Callable[[], bool], int], bool] | None = None,
+    submit_broadcast: Callable[[Callable[[], None], int], bool] | None = None,
 ) -> bool:
     """
     Xử lý lệnh từ người dùng.
@@ -341,16 +379,17 @@ def handle_command(
         if peer is not None:
             if submit_chat is None:
                 _open_chat(peer_key, peer)
-            elif not submit_chat(command, partial(_open_chat, peer_key, peer)):
+            elif not submit_chat(command, partial(_open_chat, peer_key, peer), 0):
                 print_warning("Hàng đợi chat đang đầy. Vui lòng thử lại.")
         return False
 
     if submit_chat is not None and (
         command in ("", "/send", "/file", "/leave", "/history")
     ):
-        if not command and not _message_fits_queue(cmd_raw):
+        payload_bytes = _message_payload_size(cmd_raw) if not command else 0
+        if payload_bytes is None:
             return False
-        if not submit_chat(command, partial(handle_command, cmd_raw)):
+        if not submit_chat(command, partial(handle_command, cmd_raw), payload_bytes):
             print_warning("Hàng đợi chat đang đầy. Vui lòng thử lại.")
         return False
 
@@ -400,11 +439,13 @@ def handle_command(
     elif command == "/broadcast":
         if not args:
             print_warning("Cú pháp: /broadcast <nội_dung_thông_báo>")
-        elif not _message_fits_queue(args, BROADCAST_PREFIX):
             return False
-        elif submit_broadcast is None:
+        payload_bytes = _message_payload_size(args, len(BROADCAST_PREFIX))
+        if payload_bytes is None:
+            return False
+        if submit_broadcast is None:
             _broadcast_text(args)
-        elif not submit_broadcast(partial(_broadcast_text, args)):
+        elif not submit_broadcast(partial(_broadcast_text, args), payload_bytes):
             print_warning("Hàng đợi broadcast đang đầy. Vui lòng thử lại.")
 
     # ------------------ /send (/file alias) ------------------
@@ -463,13 +504,19 @@ def handle_command(
 # Hàm khởi chạy chính (Main Function)
 # ---------------------------------------------------------------------------
 
-def _shutdown_workers(workers: list[threading.Thread], finish_history: Callable[[float], bool | None] | None):
+def _shutdown_workers(
+    workers: list[threading.Thread],
+    finish_history: Callable[[float], bool | None] | None,
+    cancel_queued: list[Callable[[], None]],
+):
     state.stop_event.set()
     deadline = time.monotonic() + 2.0
 
     def remaining():
         return max(0.0, deadline - time.monotonic())
 
+    for cancel in cancel_queued:
+        cancel()
     close_chat_connections()
     file_stopped = stop_file_sender(timeout=remaining())
     tcp_drained = drain_tcp_workers(timeout=remaining())
@@ -555,6 +602,7 @@ def main():
         print_success(f"Máy chủ TCP đang lắng nghe trên cổng {state.my_tcp_port}.")
 
         workers = [t_tcp, t_reconnect]
+        cancel_queued = []
         finish_history = None
         try:
             try:
@@ -565,10 +613,14 @@ def main():
                 print_success("Hệ thống UDP Discovery đã sẵn sàng.")
 
             _, finish_history = start_autosave_thread()
-            t_chat, submit_chat = _start_chat_worker()
+            t_chat, submit_chat, cancel_chat = _start_chat_worker()
             workers.append(t_chat)
-            t_broadcast, submit_broadcast = _start_command_worker("Chat-Broadcast", 8)
+            cancel_queued.append(cancel_chat)
+            t_broadcast, submit_broadcast, cancel_broadcast = _start_command_worker(
+                "Chat-Broadcast", 8, BROADCAST_QUEUE_BYTES,
+            )
             workers.append(t_broadcast)
+            cancel_queued.append(cancel_broadcast)
             print_info("Gõ /list để xem danh sách online, /chat <tên|số> để trò chuyện. Nhấn Tab để gợi ý lệnh.\n")
 
             while not state.stop_event.is_set():
@@ -585,7 +637,7 @@ def main():
         except RuntimeError as e:
             print_error(f"Không thể khởi động worker: {e}")
         finally:
-            _shutdown_workers(workers, finish_history)
+            _shutdown_workers(workers, finish_history, cancel_queued)
 
 
 if __name__ == "__main__":

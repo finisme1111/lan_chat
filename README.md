@@ -213,7 +213,9 @@ Mỗi instance gửi một file tại một thời điểm, tối đa 2 GiB mỗ
 
 Quota tính file thường hiện có trực tiếp trong `downloads/` và kích thước đã đặt trước cho các lượt nhận cùng instance. Khi vượt quota hoặc thiếu dung lượng trống, ứng dụng từ chối lượt nhận mới. Dùng `--data-dir` riêng cho từng instance để mỗi instance quản lý reservation riêng.
 
-TCP chat có deadline ghi 10 giây cho mỗi frame. `/broadcast` chạy trên queue riêng, tối đa 8 lệnh đang chờ. Khi thoát, ứng dụng chờ tối đa 2 giây cho lần lưu history cuối, rồi cảnh báo nếu chưa nhận được kết quả.
+TCP chat có deadline ghi 10 giây cho mỗi frame. Queue chat có tối đa 64 lệnh chờ và ngân sách payload 32 MiB. Queue `/broadcast` có tối đa 8 lệnh chờ và ngân sách riêng 16 MiB. Ngân sách tính byte UTF-8 của tin nhắn đang chờ và đang xử lý, gồm prefix `[Broadcast]`. Mỗi tin vẫn giới hạn 10 MiB. Khi một queue đầy, ứng dụng từ chối lệnh mới và báo để người dùng thử lại. RAM thực tế còn gồm history, socket buffer và overhead của Python.
+
+Khi thoát, ứng dụng báo số lệnh chưa chạy bị hủy và chờ tối đa 2 giây cho lần lưu history cuối. `/history` chụp phần tin cần hiển thị, gồm cả tin chưa đọc nằm trước cửa sổ 20 tin gần nhất. Định dạng `chat_history.json` và chính sách giữ history được giữ nguyên.
 
 ## Kiểm thử
 
@@ -296,7 +298,7 @@ Chạy hai lệnh trên từ Kitty để kiểm tra redraw trực tiếp. Có th
 | I · Multi-instance trên cùng máy | PASS | Ba process loopback và hai cửa sổ Kitty đã chạy thành công. |
 | I · Demo hai máy vật lý trên LAN | UNVERIFIED | Chờ đồng đội có máy thứ hai. |
 
-Các quyết định còn mở gồm quota khi nhiều process dùng chung `--data-dir`, giới hạn tổng byte của hàng đợi chat và chính sách giữ history trong RAM. Hành vi firewall, broadcast qua Wi-Fi và hard link trên filesystem khác cần được đánh giá trong môi trường triển khai.
+Các quyết định còn mở gồm quota khi nhiều process dùng chung `--data-dir` và chính sách giữ history trong RAM. Hành vi firewall, broadcast qua Wi-Fi và hard link trên filesystem khác cần được đánh giá trong môi trường triển khai.
 
 ---
 
