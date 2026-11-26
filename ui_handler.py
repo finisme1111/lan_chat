@@ -61,7 +61,15 @@ def _display_text(text: str) -> str:
 
 def _print_fragments(*fragments):
     with _output_lock:
-        print_formatted_text(FormattedText(fragments), style=APP_STYLE)
+        try:
+            print_formatted_text(FormattedText(fragments), style=APP_STYLE)
+        except Exception as e:
+            # Trên Windows khi stdout bị pipe (vd: chạy test hoặc redirect), prompt_toolkit
+            # không tạo được Win32Output; fallback về in plain text để không crash.
+            if type(e).__name__ == "NoConsoleScreenBufferError":
+                print("".join(text for _, text in fragments), flush=True)
+            else:
+                raise
 
 
 def _print_notice(style: str, label: str, message: str):
@@ -117,8 +125,11 @@ BANNER = r"""
 """
 
 HELP_TEXT = """
-┌─ Lệnh Discovery ──────────────────────────────────────┐
+┌─ Lệnh Discovery & Kết nối trực tiếp ──────────────────┐
 │  /list              Hiển thị danh sách peer online     │
+│  /connect <ip:port> Nạp và kết nối thẳng tới máy đích  │
+│  /peer add <ip:port> [tên]   Nạp máy đích vào danh sách│
+│  /peer remove <tên|số|ip:port>  Xóa máy đích           │
 │  /status <s>        Đổi trạng thái (online|away)       │
 ├─ Lệnh Chat ───────────────────────────────────────────┤
 │  /chat <tên|số>     Bắt đầu chat với peer              │
@@ -163,8 +174,10 @@ def display_peer_list(peers):
         with state.conn_lock:
             is_connected = key in state.connections
 
-        # Hiển thị badge: kết nối TCP đang mở và tin chưa đọc
+        # Hiển thị badge: kết nối TCP đang mở, peer trực tiếp và tin chưa đọc
         badges = []
+        if peer.is_static:
+            badges.append("📌 direct")
         if is_connected:
             badges.append("🔗 connected")
         if unread > 0:
@@ -233,7 +246,7 @@ def display_chat_history(peer_key: str, last_n: int = 20):
 
 # Danh sách tất cả lệnh — dùng để complete khi user gõ '/'
 _ALL_COMMANDS = [
-    "/list", "/chat", "/send", "/history", "/leave",
+    "/list", "/connect", "/peer", "/chat", "/send", "/history", "/leave",
     "/file", "/broadcast", "/status", "/help", "/quit",
 ]
 
@@ -298,6 +311,25 @@ class LanChatCompleter(Completer):
                         display=_display_text(peer.name),
                         display_meta=f"{peer.ip}:{peer.tcp_port} [{peer.status}]",
                     )
+
+        # /peer <subcommand> [peer]
+        elif cmd == "/peer":
+            if " " not in arg:
+                for sub in ("add", "remove", "list"):
+                    if sub.startswith(arg.lower()):
+                        yield Completion(sub, start_position=-len(arg))
+            else:
+                sub, rest = arg.split(maxsplit=1)
+                if sub.lower() in ("remove", "rm", "del"):
+                    peers = state.get_peer_list_snapshot()
+                    for peer in peers.values():
+                        if peer.name.lower().startswith(rest.lower()):
+                            yield Completion(
+                                peer.name,
+                                start_position=-len(rest),
+                                display=_display_text(peer.name),
+                                display_meta=f"{peer.ip}:{peer.tcp_port}",
+                            )
 
         # /status <trạng thái>
         elif cmd == "/status":

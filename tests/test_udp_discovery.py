@@ -124,3 +124,13 @@ class DiscoveryTest(unittest.TestCase):
             self.assertEqual(state.remove_timed_out_peers(), ["A"])
         self.assertEqual(state.chat_history, {})
         self.assertEqual(state.unread_counts, {})
+
+    def test_static_peer_survives_udp_timeout_and_gets_unicast_target(self):
+        state = SharedState()
+        with patch.object(udp.time, "monotonic", return_value=100.0) as clock:
+            key, is_new = state.upsert_static_peer("100.86.10.2", 5002, "LinuxPeer")
+            self.assertTrue(is_new)
+            clock.return_value = 100.0 + PEER_TIMEOUT * 5
+            self.assertEqual(state.remove_timed_out_peers(), [])
+        self.assertIn(key, state.peer_list)
+        self.assertEqual(state.get_static_peer_ips(), ["100.86.10.2"])

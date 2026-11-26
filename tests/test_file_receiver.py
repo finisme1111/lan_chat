@@ -165,3 +165,13 @@ class FileReceiverTest(unittest.TestCase):
             self.assertEqual(existing.read_bytes(), b"keep")
             self.assertNotIn(directory, tcp._download_reservations)
         conn.sendall.assert_called_once_with(b"FILE_ACK|1|ERROR|")
+
+    def test_linux_special_characters_in_filename_are_sanitized(self):
+        conn = Mock(spec=socket.socket)
+        conn.recv.return_value = b"hi"
+        with TemporaryDirectory() as directory, patch.object(tcp, "DOWNLOADS_DIR", directory):
+            tcp._receive_file_stream(conn, 'sub/report:2026*?.txt ', 2, "Linux")
+            saved_files = [path.name for path in Path(directory).iterdir()]
+            self.assertEqual(saved_files, ["report_2026__.txt"])
+            self.assertEqual(Path(directory, "report_2026__.txt").read_bytes(), b"hi")
+        conn.sendall.assert_called_once_with(b"FILE_ACK|1|OK|")

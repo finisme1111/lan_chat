@@ -270,8 +270,21 @@ def _cleanup_connection(peer_key: str, sock: socket.socket) -> bool:
         if removed:
             del state.connections[peer_key]
             state.reset_partner_if(peer_key)
+    if removed:
+        with state.lock:
+            peer = state.peer_list.get(peer_key)
+            if peer is not None and peer.via_tcp and not peer.is_static:
+                peer.last_seen = time.monotonic()
     _close_chat_socket(sock)
     return removed
+
+
+def close_peer_connection(peer_key: str):
+    """Đóng kết nối TCP đang mở với một peer cụ thể (nếu có)."""
+    with state.conn_lock:
+        conn = state.connections.pop(peer_key, None)
+    if conn is not None:
+        _close_chat_socket(conn.sock)
 
 
 def close_chat_connections():
@@ -393,14 +406,34 @@ def _publish_file(part_path: str, filename: str, directory: str) -> str:
         return final_path
 
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _sanitize_download_filename(raw_filename: str) -> str:
+    """Chuẩn hóa tên file nhận được để an toàn trên cả Linux và Windows."""
+    base = raw_filename.replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(
+        "_" if (ord(ch) < 32 or ch in '<>:"/\\|?*') else ch
+        for ch in base
+    ).strip().rstrip(". ")
+    if cleaned in ("", ".", ".."):
+        return "downloaded_file"
+    stem, ext = os.path.splitext(cleaned)
+    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+        return f"_{stem}{ext}"
+    return cleaned
+
+
 def _receive_file_stream(sock: socket.socket, raw_filename: str, filesize: int, sender_name: str):
     """
     Nhận dữ liệu nhị phân của file theo chunk, ghi vào .part và đổi tên khi hoàn tất.
     Tự động xóa file .part nếu kết nối bị đứt giữa chừng.
     """
-    safe_filename = os.path.basename(raw_filename).replace("|", "_").strip()
-    if safe_filename in ("", ".", ".."):
-        safe_filename = "downloaded_file"
+    safe_filename = _sanitize_download_filename(raw_filename)
 
     part_path = None
     saved = False
@@ -569,6 +602,7 @@ def _handle_incoming(conn: socket.socket, addr: Tuple[str, int]):
                 candidate = ChatConnection(conn, outgoing=False)
                 if _register_chat_connection(peer_key, peer_ip, peer_tcp_port, candidate) is not candidate:
                     return
+                peer_key, _ = state.upsert_tcp_peer(peer_name, peer_ip, peer_tcp_port)
 
                 _restore_selected_peer(peer_key, expected_socket=conn)
                 logger.info(f"[TCP] Chấp nhận kết nối CHAT từ {peer_name} ({peer_key})")
@@ -917,7 +951,7 @@ def start_tcp_threads(
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind(("", state.my_tcp_port))
+        server_sock.bind((state.my_bind_ip, state.my_tcp_port))
         server_sock.listen(15)
         server_sock.settimeout(1.0)
         t_acceptor = threading.Thread(
