@@ -9,6 +9,7 @@ Các tính năng nổi bật:
 """
 
 import argparse
+import json
 import logging
 import os
 import queue
@@ -29,6 +30,7 @@ from protocol import MAX_MSG_LEN, UDP_PORT, normalize_peer_name
 from tcp_handler import (
     FileSendResult,
     close_chat_connections,
+    close_peer_connection,
     drain_tcp_workers,
     get_or_connect,
     send_chat_message,
@@ -145,6 +147,145 @@ def _make_send_file_progress(filename: str):
 # Tìm kiếm Peer theo tên
 # ---------------------------------------------------------------------------
 
+def _resolve_ipv4(host: str) -> str:
+    """Chuyển hostname hoặc IP thành địa chỉ IPv4."""
+    try:
+        socket.inet_aton(host)
+        return host
+    except OSError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as e:
+        raise ValueError(f"Không thể phân giải địa chỉ '{host}': {e}") from e
+    if not infos:
+        raise ValueError(f"Không tìm thấy địa chỉ IPv4 cho '{host}'.")
+    return infos[0][4][0]
+
+
+def _parse_peer_spec(raw: str) -> tuple[str, int, str | None]:
+    """
+    Phân tích chuỗi đích dạng:
+      - <host>:<port>
+      - <host>:<port>=<tên>
+      - <host>:<port> <tên>
+      - <host> <port> [tên]
+    """
+    text = raw.strip()
+    if not text:
+        raise ValueError("Thiếu địa chỉ máy đích.")
+
+    tokens = text.split(maxsplit=2)
+    name: str | None = None
+    first = tokens[0]
+    if ":" in first:
+        host_port = first
+        if "=" in first:
+            host_port, name_part = first.split("=", 1)
+            name = name_part.strip() or None
+        elif len(tokens) > 1:
+            name = " ".join(tokens[1:]).strip() or None
+        host, port_str = host_port.rsplit(":", 1)
+    elif len(tokens) >= 2:
+        host, port_str = tokens[0], tokens[1]
+        if len(tokens) == 3:
+            name = tokens[2].strip() or None
+    else:
+        raise ValueError("Cú pháp hợp lệ: <ip|host>:<port> [tên] hoặc <ip|host> <port> [tên]")
+
+    host = host.strip()
+    if not host:
+        raise ValueError("Tên host hoặc IP không được rỗng.")
+    try:
+        port = int(port_str)
+    except ValueError as e:
+        raise ValueError(f"Port không hợp lệ: '{port_str}'.") from e
+    if not 1 <= port <= 65535:
+        raise ValueError("Port phải nằm trong khoảng 1–65535.")
+    return _resolve_ipv4(host), port, name
+
+
+def _register_static_peer(raw: str) -> tuple[str, Peer]:
+    ip, port, name = _parse_peer_spec(raw)
+    peer_key, _ = state.upsert_static_peer(ip, port, name=name)
+    peer = state.get_peer_list_snapshot()[peer_key]
+    return peer_key, peer
+
+
+def _prepare_direct_peer(args: str):
+    if not args:
+        print_warning("Cú pháp: /connect <ip|host>:<port> [tên] hoặc /connect <ip|host> <port> [tên]")
+        return None, None
+    try:
+        return _register_static_peer(args)
+    except ValueError as e:
+        print_warning(str(e))
+        return None, None
+
+
+def _load_peers_file(path: Path) -> list[str]:
+    content = path.read_text(encoding="utf-8")
+    stripped = content.lstrip()
+    if path.suffix.lower() == ".json" or stripped.startswith(("[", "{")):
+        data = json.loads(content)
+        specs: list[str] = []
+        if isinstance(data, dict):
+            for name, target in data.items():
+                specs.append(f"{target} {name}")
+            return specs
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    specs.append(item)
+                elif isinstance(item, dict) and "host" in item and "port" in item:
+                    name = item.get("name")
+                    specs.append(f"{item['host']}:{item['port']}" + (f" {name}" if name else ""))
+                else:
+                    raise ValueError("Phần tử JSON peer không hợp lệ.")
+            return specs
+        raise ValueError("File JSON peers phải là list hoặc dict.")
+
+    specs = []
+    for line in content.splitlines():
+        clean = line.split("#", 1)[0].strip()
+        if clean:
+            specs.append(clean)
+    return specs
+
+
+def _handle_peer_command(args: str):
+    if not args:
+        print_warning("Cú pháp: /peer <add|remove|list> ...")
+        return
+    parts = args.split(maxsplit=1)
+    sub = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub == "list":
+        handle_command("/list")
+    elif sub == "add":
+        if not rest:
+            print_warning("Cú pháp: /peer add <ip|host>:<port> [tên]")
+            return
+        peer_key, peer = _prepare_direct_peer(rest)
+        if peer is not None:
+            print_success(f"Đã nạp máy đích {peer.name} ({peer.ip}:{peer.tcp_port}).")
+    elif sub in ("remove", "rm", "del"):
+        if not rest:
+            print_warning("Cú pháp: /peer remove <tên|số|ip:port>")
+            return
+        peers = state.get_peer_list_snapshot()
+        peer_key = rest if rest in peers else _find_peer(rest)[0]
+        if peer_key is None:
+            return
+        close_peer_connection(peer_key)
+        removed = state.remove_peer(peer_key)
+        if removed is not None:
+            print_success(f"Đã xóa máy đích {removed.name} ({removed.ip}:{removed.tcp_port}).")
+    else:
+        print_warning("Cú pháp: /peer <add|remove|list> ...")
+
+
 def _find_peer(selector: str):
     if not selector:
         print_warning("Cú pháp: /chat <tên|số> (Gõ /list để xem số)")
@@ -256,7 +397,7 @@ def _start_chat_worker():
 
     def submit(command: str, job: Callable[[], bool]) -> bool:
         nonlocal pending_selection
-        selection = Future() if command == "/chat" else None
+        selection = Future() if command in ("/chat", "/connect") else None
         depends_on = pending_selection if command in ("", "/send", "/file") else None
         if depends_on is not None and depends_on.done():
             depends_on = None
@@ -336,8 +477,11 @@ def handle_command(
     parts = cmd.split(maxsplit=1)
     command = parts[0].lower() if cmd.startswith("/") else ""
     args = parts[1].strip() if len(parts) > 1 else ""
-    if command == "/chat":
-        peer_key, peer = _find_peer(args)
+    if command in ("/chat", "/connect"):
+        if command == "/chat":
+            peer_key, peer = _find_peer(args)
+        else:
+            peer_key, peer = _prepare_direct_peer(args)
         if peer is not None:
             if submit_chat is None:
                 _open_chat(peer_key, peer)
@@ -442,6 +586,10 @@ def handle_command(
         if not start_file_send(peer_key, clean_path, progress_cb, report_result):
             print_warning("Đang có lượt gửi file. Vui lòng thử lại khi lượt đó kết thúc.")
 
+    # ------------------ /peer ------------------
+    elif command == "/peer":
+        _handle_peer_command(args)
+
     # ------------------ /help ------------------
     elif command == "/help":
         print_help()
@@ -503,6 +651,22 @@ def main():
         "--download-quota-gib", type=int, default=DEFAULT_DOWNLOAD_QUOTA_GIB,
         help="Quota downloads tính bằng GiB (mặc định: %(default)s)",
     )
+    parser.add_argument(
+        "--peer", action="append", default=[], metavar="HOST:PORT",
+        help="Nạp sẵn địa chỉ máy đích (có thể lặp lại, vd: --peer 100.x.y.z:5002)",
+    )
+    parser.add_argument(
+        "--peers-file", type=Path, default=None,
+        help="Đọc danh sách máy đích từ file (.txt hoặc .json)",
+    )
+    parser.add_argument(
+        "--bind", default="",
+        help="Địa chỉ IP cục bộ để TCP lắng nghe (mặc định: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--no-udp", action="store_true",
+        help="Tắt UDP discovery (dùng khi kết nối thuần TCP / SSH tunnel)",
+    )
     parser.add_argument("--debug", action="store_true", help="Bật chế độ ghi log chi tiết")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
@@ -516,13 +680,31 @@ def main():
     except (OSError, RuntimeError) as e:
         parser.error(f"Không thể mở --data-dir: {e}")
 
+    peer_specs = []
+    if args.peers_file is not None:
+        try:
+            peer_specs.extend(_load_peers_file(args.peers_file.expanduser()))
+        except (OSError, ValueError) as e:
+            parser.error(f"Không thể đọc --peers-file: {e}")
+    peer_specs.extend(args.peer)
+
     # 1. Khởi tạo trạng thái danh tính cá nhân
     state.my_name = normalize_peer_name(args.name)
     state.my_tcp_port = args.port
-    state.my_ip = get_local_ip()
+    state.my_bind_ip = args.bind.strip()
+    state.my_ip = state.my_bind_ip or get_local_ip()
 
     # 2. Tải lịch sử chat đã lưu từ phiên trước
     loaded_msgs = load_history()
+
+    # Nạp sẵn danh sách peer đích sau khi load_history để giữ lịch sử chat theo endpoint
+    loaded_peers = []
+    for spec in peer_specs:
+        try:
+            _, peer = _register_static_peer(spec)
+            loaded_peers.append(peer)
+        except ValueError as e:
+            parser.error(f"Tham số --peer không hợp lệ ({spec!r}): {e}")
 
     # 3. Tạo session giao diện điều khiển với prompt_toolkit
     session = create_prompt_session()
@@ -541,6 +723,8 @@ def main():
         print_info(f"Danh tính: {state.my_name} | IP: {state.my_ip} | Cổng TCP: {state.my_tcp_port}")
         if loaded_msgs > 0:
             print_info(f"Đã nạp {loaded_msgs} tin nhắn từ tệp lịch sử.")
+        if loaded_peers:
+            print_info(f"Đã nạp sẵn {len(loaded_peers)} máy đích.")
         print_help()
 
         # Chỉ quảng bá sau khi TCP listener đã bind thành công.
@@ -557,12 +741,15 @@ def main():
         workers = [t_tcp, t_reconnect]
         finish_history = None
         try:
-            try:
-                workers.extend(start_udp_threads(notify_fn=notify_system))
-            except (OSError, RuntimeError) as e:
-                print_error(f"Không thể mở UDP discovery port {UDP_PORT}: {e}")
+            if args.no_udp:
+                print_info("Đã tắt UDP Discovery (--no-udp). Dùng --peer hoặc /connect để kết nối trực tiếp.")
             else:
-                print_success("Hệ thống UDP Discovery đã sẵn sàng.")
+                try:
+                    workers.extend(start_udp_threads(notify_fn=notify_system))
+                except (OSError, RuntimeError) as e:
+                    print_error(f"Không thể mở UDP discovery port {UDP_PORT}: {e}")
+                else:
+                    print_success("Hệ thống UDP Discovery đã sẵn sàng.")
 
             _, finish_history = start_autosave_thread()
             t_chat, submit_chat = _start_chat_worker()

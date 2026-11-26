@@ -231,3 +231,38 @@ class CommandsTest(unittest.TestCase):
         chat.assert_not_called()
         broadcast.assert_not_called()
         self.assertEqual(self.warning.call_count, 2)
+
+    def test_connect_registers_static_peer_and_opens_chat(self):
+        conn = Mock()
+
+        def connect(key):
+            self.state.connections[key] = ChatConnection(conn, outgoing=True)
+            return conn
+
+        with patch.object(main, "get_or_connect", side_effect=connect) as dial:
+            main.handle_command("/connect 100.86.10.2:5002 LinuxBox")
+            dial.assert_called_once_with("100.86.10.2:5002")
+        peer = self.state.peer_list["100.86.10.2:5002"]
+        self.assertTrue(peer.is_static)
+        self.assertEqual(peer.name, "LinuxBox")
+        self.assertEqual(self.state.current_partner, "100.86.10.2:5002")
+
+    def test_peer_add_and_remove_manage_static_peer(self):
+        main.handle_command("/peer add 10.232.1.10 5005 Ubuntu")
+        self.assertIn("10.232.1.10:5005", self.state.peer_list)
+        conn = Mock()
+        self.state.connections["10.232.1.10:5005"] = ChatConnection(conn, outgoing=True)
+        with patch.object(main, "close_peer_connection") as close_conn:
+            main.handle_command("/peer remove Ubuntu")
+            close_conn.assert_called_once_with("10.232.1.10:5005")
+        self.assertNotIn("10.232.1.10:5005", self.state.peer_list)
+
+    def test_load_peers_file_supports_text_and_json(self):
+        with TemporaryDirectory() as directory:
+            txt = Path(directory, "peers.txt")
+            txt.write_text("# comment\n100.86.1.2:5002 Linux # inline\n\n10.0.0.3 5003\n", encoding="utf-8")
+            self.assertEqual(main._load_peers_file(txt), ["100.86.1.2:5002 Linux", "10.0.0.3 5003"])
+
+            js = Path(directory, "peers.json")
+            js.write_text('[{"host": "100.86.1.2", "port": 5002, "name": "Linux"}]', encoding="utf-8")
+            self.assertEqual(main._load_peers_file(js), ["100.86.1.2:5002 Linux"])

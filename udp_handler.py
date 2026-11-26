@@ -52,7 +52,8 @@ def broadcaster_thread(sock: socket.socket):
         while not state.stop_event.is_set():
             name, port, status = state.my_name, state.my_tcp_port, state.my_status
             packets = (encode_hello(name, port, status, state.instance_id), encode_hello(name, port, status))
-            for address in dict.fromkeys((UDP_BROADCAST_ADDR, UDP_LOOPBACK_ADDR)):
+            targets = [UDP_BROADCAST_ADDR, UDP_LOOPBACK_ADDR, *state.get_static_peer_ips()]
+            for address in dict.fromkeys(targets):
                 for packet in packets:
                     try:
                         sock.sendto(packet, (address, UDP_PORT))

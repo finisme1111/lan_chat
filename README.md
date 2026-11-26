@@ -158,7 +158,7 @@ python3 main.py --name An --port 5003 --data-dir ./data-an
 ### Tham số khởi động
 
 ```
-python3 main.py --name <tên> --port <port> [--data-dir <thư mục>] [--download-quota-gib <GiB>] [--debug]
+python3 main.py --name <tên> --port <port> [--data-dir <thư mục>] [--peer HOST:PORT] [--peers-file <file>] [--bind <ip>] [--no-udp] [--download-quota-gib <GiB>] [--debug]
 ```
 
 | Tham số | Mô tả | Ví dụ |
@@ -166,16 +166,55 @@ python3 main.py --name <tên> --port <port> [--data-dir <thư mục>] [--downloa
 | `--name` | Tên hiển thị của bạn | `--name Quan` |
 | `--port` | TCP port lắng nghe (1–65535) | `--port 5001` |
 | `--data-dir` | Thư mục history và downloads, mặc định là working directory | `--data-dir ./data-quan` |
+| `--peer` | Nạp sẵn địa chỉ máy đích (có thể lặp lại nhiều lần) | `--peer 100.86.10.2:5002` |
+| `--peers-file` | Nạp danh sách máy đích từ file `.txt` hoặc `.json` | `--peers-file peers.txt` |
+| `--bind` | Địa chỉ IP cục bộ để TCP lắng nghe (mặc định `0.0.0.0`) | `--bind 100.86.87.0` |
+| `--no-udp` | Tắt UDP discovery (dùng khi chạy thuần TCP / SSH tunnel) | `--no-udp` |
 | `--download-quota-gib` | Quota file nhận tính bằng GiB, mặc định 8 | `--download-quota-gib 16` |
 | `--debug` | Bật log chi tiết (socket, thread) | `--debug` |
+
+---
+
+### Kết nối tới máy đích Linux (LAN / Tailscale / SSH Tunnel)
+
+Khi UDP broadcast bị chặn (Wi-Fi trường/công cộng, qua VPN Tailscale, hoặc qua SSH tunnel), bạn có thể nạp thẳng địa chỉ máy đích bằng `--peer`, `--peers-file`, hoặc lệnh `/connect` ngay trong terminal:
+
+1. **Qua Tailscale** (hoặc cùng LAN không chặn TCP):
+   - Trên máy Linux:
+     ```bash
+     python3 main.py --name LinuxPeer --port 5002
+     ```
+     *(Mở TCP port `5002` trên firewall Linux nếu có, ví dụ `sudo ufw allow 5002/tcp`.)*
+   - Trên máy Windows:
+     ```powershell
+     .\.venv\Scripts\python main.py --name WinPeer --port 5001 --peer <IP_Tailscale_hoac_LAN_Linux>:5002
+     ```
+     Hoặc mở app rồi gõ `/connect <IP_Linux>:5002`. Khi Windows kết nối TCP thành công, phía Linux sẽ tự nhận diện peer để `/chat` và `/send` ngược lại.
+
+2. **Qua SSH Tunnel** (khi chỉ kết nối được cổng SSH 22):
+   - Mở tunnel từ Windows sang Linux:
+     ```powershell
+     ssh -L 5002:127.0.0.1:5002 -R 5001:127.0.0.1:5001 <user>@<linux_host>
+     ```
+   - Trên máy Linux:
+     ```bash
+     python3 main.py --name LinuxPeer --port 5002 --no-udp
+     ```
+   - Trên máy Windows:
+     ```powershell
+     .\.venv\Scripts\python main.py --name WinPeer --port 5001 --no-udp --peer 127.0.0.1:5002
+     ```
 
 ---
 
 ### Danh sách lệnh
 
 ```
-┌─ Discovery ───────────────────────────────────────────┐
+┌─ Discovery & Kết nối trực tiếp ───────────────────────┐
 │  /list              Hiển thị peer đang online          │
+│  /connect <ip:port> Nạp và kết nối thẳng tới máy đích  │
+│  /peer add <ip:port> [tên]   Nạp máy đích vào danh sách│
+│  /peer remove <tên|số|ip:port>  Xóa máy đích           │
 │  /status <s>        Đổi trạng thái (online|away)      │
 ├─ Chat 1-1 ────────────────────────────────────────────┤
 │  /chat <tên|số>     Kết nối và bắt đầu chat            │

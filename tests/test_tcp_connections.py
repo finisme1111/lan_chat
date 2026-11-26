@@ -323,3 +323,13 @@ class ChatConnectionsTest(unittest.TestCase):
         self.accept_chat(incoming, 5002)
         self.assertIsNone(self.state.current_partner)
         self.assertIs(tcp.get_or_connect(self.peer_key), incoming)
+
+    def test_incoming_chat_handshake_registers_unknown_tcp_peer(self):
+        incoming = self.make_socket(5001, 61001)
+        incoming.getpeername.return_value = ("100.86.87.99", 61001)
+        self.accept_chat(incoming, 5009, name="LinuxHost")
+        key = "100.86.87.99:5009"
+        self.assertIn(key, self.state.peer_list)
+        self.assertEqual(self.state.peer_list[key].name, "LinuxHost")
+        self.assertTrue(self.state.peer_list[key].via_tcp)
+        self.assertIs(tcp.get_or_connect(key), incoming)
