@@ -16,12 +16,14 @@ import threading
 from contextlib import nullcontext
 from unittest.mock import Mock
 
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.output.plain_text import PlainTextOutput
+
 import history
 import main
 
 mode = sys.argv.pop(1)
-main.patch_stdout = nullcontext
-main.create_prompt_session = lambda: Mock(prompt=lambda _: "/quit")
+main._interactive_console = lambda _: nullcontext(Mock(prompt=lambda _: "/quit"))
 main.get_local_ip = lambda: "127.0.0.1"
 
 if mode == "reject":
@@ -54,7 +56,8 @@ if mode == "writer":
         return worker, lambda _: finish(0)
     main.start_autosave_thread = start_autosave
 
-main.main()
+with create_app_session(output=PlainTextOutput(sys.stdout)):
+    main.main()
 if mode == "writer":
     assert started.wait(3), "final save did not start"
     print("OWNER_READY", flush=True)
@@ -117,6 +120,11 @@ class DataDirectoryLockTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("Hãy chọn --data-dir riêng", result.stderr)
 
+    def assert_startup_failure_reported(self, folder=None):
+        result = self.run_cli("startup-failure", folder)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("simulated startup failure", result.stdout)
+
     def test_rejects_resolved_alias_before_touching_history_or_network(self):
         history_file = self.directory / "chat_history.json"
         history_file.write_bytes(b'{"peer":["keep me"]}')
@@ -129,11 +137,11 @@ class DataDirectoryLockTest(unittest.TestCase):
         self.assertEqual(history_file.read_bytes(), b'{"peer":["keep me"]}')
         self.assertEqual(kept_file.read_bytes(), b"data")
         other = self.directory / "other"
-        self.assertEqual(self.run_cli("startup-failure", other).returncode, 0)
+        self.assert_startup_failure_reported(other)
         self.assertTrue((other / LOCK_FILENAME).is_file())
         owner.communicate("\n", timeout=6)
         self.assertEqual(owner.returncode, 0)
-        self.assertEqual(self.run_cli("startup-failure").returncode, 0)
+        self.assert_startup_failure_reported()
         self.assertTrue((self.directory / LOCK_FILENAME).is_file())
 
     def test_os_releases_lock_after_forced_termination(self):
@@ -141,20 +149,20 @@ class DataDirectoryLockTest(unittest.TestCase):
         self.assert_locked(self.run_cli("reject"))
         owner.kill()
         owner.wait(timeout=5)
-        self.assertEqual(self.run_cli("startup-failure").returncode, 0)
+        self.assert_startup_failure_reported()
 
     def test_os_releases_lock_after_unexpected_startup_exception(self):
         result = self.run_cli("exception")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("simulated startup exception", result.stderr)
-        self.assertEqual(self.run_cli("startup-failure").returncode, 0)
+        self.assert_startup_failure_reported()
 
     def test_data_directory_is_still_owned_after_bounded_shutdown(self):
         owner = self.start_owner("writer")
         self.assert_locked(self.run_cli("reject"))
         owner.communicate("\n", timeout=6)
         self.assertEqual(owner.returncode, 0)
-        self.assertEqual(self.run_cli("startup-failure").returncode, 0)
+        self.assert_startup_failure_reported()
 
     def test_clear_error_when_lock_cannot_be_opened(self):
         (self.directory / LOCK_FILENAME).mkdir()

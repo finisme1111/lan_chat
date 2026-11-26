@@ -118,19 +118,19 @@ python3 main.py --name Quan --port 5001
 
 ### 🪟 Windows
 
+Mở PowerShell trong thư mục `lan_chat`. Dùng cùng interpreter trong venv để cài dependency, chạy ứng dụng và chạy test.
+
 ```powershell
-# Mở PowerShell hoặc Command Prompt
-cd lan_chat
-
 python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements.txt
-
-# Chạy
-.\.venv\Scripts\python main.py --name Quan --port 5001
+$Python = Join-Path $PWD.Path '.venv\Scripts\python.exe'
+& $Python -m pip install -r .\requirements.txt
+& $Python -m pip check
+& $Python -B .\main.py --name Quan --port 5001
 ```
 
 > **⚠️ Lưu ý quan trọng trên Windows:**
 >
+> - Chạy ứng dụng trong console tương tác như Windows Terminal hoặc PowerShell. Khi stdin hoặc stdout bị chuyển hướng, hoặc Windows console không khởi tạo được, ứng dụng báo lỗi hướng dẫn trên stderr và thoát với mã `2` trước khi mở thư mục dữ liệu hoặc socket.
 > - `SO_REUSEPORT` không có sẵn trên Windows → code tự bỏ qua (dùng `hasattr` check), không bị crash.
 > - Test **nhiều instance trên cùng 1 máy** có thể không hoạt động do Windows không cho phép 2 socket cùng bind `0.0.0.0:9999`. Hãy test trên **2 máy thật** trong cùng mạng LAN.
 > - Nếu Windows Firewall chặn → cho phép Python qua Firewall khi được hỏi.
@@ -215,7 +215,7 @@ Quota tính file thường hiện có trực tiếp trong `downloads/` và kích
 
 Mỗi `--data-dir` sau khi resolve chỉ dành cho một instance tại một thời điểm. Dùng thư mục riêng để chạy nhiều instance. Ứng dụng khóa file `.lan-chat.lock` trước khi đọc history hoặc khởi tạo mạng, và báo lỗi nếu thư mục đang được dùng hoặc hệ điều hành không cấp được lock. OS giải phóng lock khi process kết thúc, kể cả khi process bị dừng cưỡng bức. File lock vẫn nằm trong thư mục để các lần chạy luôn khóa cùng một file. Đừng xóa hoặc thay thế file lock khi ứng dụng đang chạy.
 
-Lock đã được kiểm tra trên Arch Linux. macOS dùng `flock` như Linux. Windows dùng `msvcrt.locking`. Runtime trên macOS và Windows chưa được xác minh. Dùng filesystem cục bộ có hỗ trợ khóa của OS. Các bản cũ chưa có lock vẫn có thể truy cập cùng thư mục, vì vậy hãy dùng data directory riêng khi chạy song song với bản cũ.
+Regression subprocess đã xác minh khóa và lấy lại khóa trên Arch Linux và Windows native. Windows dùng `msvcrt.locking`. macOS dùng `flock` và vẫn chưa được xác minh runtime. Dùng filesystem cục bộ có hỗ trợ khóa của OS. Các bản cũ chưa có lock vẫn có thể truy cập cùng thư mục, vì vậy hãy dùng data directory riêng khi chạy song song với bản cũ.
 
 TCP chat có deadline ghi 10 giây cho mỗi frame. Queue chat có tối đa 64 lệnh chờ và ngân sách payload 32 MiB. Queue `/broadcast` có tối đa 8 lệnh chờ và ngân sách riêng 16 MiB. Ngân sách tính byte UTF-8 của tin nhắn đang chờ và đang xử lý, gồm prefix `[Broadcast]`. Mỗi tin vẫn giới hạn 10 MiB. Khi một queue đầy, ứng dụng từ chối lệnh mới và báo để người dùng thử lại. RAM thực tế còn gồm history, socket buffer và overhead của Python.
 
@@ -230,13 +230,25 @@ python3 -B -m unittest discover -s tests -v
 python3 -B run_auto_test.py
 ```
 
+Trên Windows, sau khi cài dependency theo hướng dẫn ở trên:
+
+```powershell
+$Python = Join-Path $PWD.Path '.venv\Scripts\python.exe'
+& $Python -B -m unittest discover -s tests -v
+& $Python -B .\run_auto_test.py
+```
+
+Windows ghi hai skip theo nền tảng là `POSIX FIFO required` và `POSIX PTY required`. Ghi riêng số skip khi báo kết quả kiểm thử.
+
 Regression tests bao gồm socket ownership, framing, timeout, storage, command parsing và redraw qua pipe input và POSIX PTY. PTY test kiểm tra ANSI output, draft, cursor và thông báo unread.
 
 Integration harness chạy ba subprocess trên IPv4 loopback với cổng động và data directory tạm riêng. Subprocess nhận lệnh từng dòng để kiểm tra CLI và network; regression PTY kiểm tra phần render. Harness dùng gate để buộc hai peer cùng dial trước khi gửi HELLO và giữ upload sau chunk đầu tiên trong khi kiểm tra chat. Một scenario TCP loopback kiểm tra receiver đóng kết nối khi payload CHAT ngừng tiến triển trong khi CLI vẫn phản hồi. Fault injection chỉ hoạt động trong test subprocess. Script trả exit code khác 0 khi có lỗi.
 
+Trên Linux, harness dùng UDP broadcast trên loopback. Trên Windows, mỗi subprocess bind một cổng UDP riêng ở `127.0.0.1`. Socket wrapper chuyển mỗi lượt quảng bá thành các datagram unicast thật tới các cổng test, giữ nguyên payload `HELLO` và `HELLO2`. Bài test vẫn xác minh discovery, presence và expiry qua UDP, cùng chat và file qua TCP. Cấu hình broadcast của ứng dụng production được giữ nguyên. Broadcast trên LAN vật lý và capture Wireshark vẫn cần xác minh riêng.
+
 ### Kiểm tra thủ công trên hai máy cùng LAN
 
-**UNVERIFIED.** Đang chờ đồng đội có máy thứ hai để chạy các bước dưới đây trên mạng LAN thực tế.
+**PENDING.** Các bước dưới đây chưa được chạy trên hai máy vật lý.
 
 Chạy từ thư mục repository tương ứng trên mỗi máy, với Python và dependency đã sẵn có. Dùng Wi-Fi hoặc Ethernet thuộc cùng IPv4 subnet. Nếu hai máy cùng SSID nhưng không thấy nhau, kiểm tra guest network, AP isolation và firewall. Cho phép nhận UDP **9999** và TCP port của tiến trình trên interface LAN, trong phạm vi hai máy thử nghiệm. `--port` cấu hình TCP listener. UDP discovery gửi broadcast mỗi khoảng 3 giây và peer hết hạn sau khoảng 10 giây không nhận HELLO.
 
@@ -302,7 +314,7 @@ Chạy hai lệnh trên từ Kitty để kiểm tra redraw trực tiếp. Có th
 | H · Capture Wireshark thật | UNVERIFIED | Chưa có capture cho UDP discovery, TCP handshake và các stream chat/file. |
 | H · Báo cáo 5–10 trang | UNVERIFIED | Tài liệu nộp riêng ngoài phạm vi xác minh Phase 3 này. |
 | I · Multi-instance trên cùng máy | PASS | Ba process loopback và hai cửa sổ Kitty đã chạy thành công. |
-| I · Demo hai máy vật lý trên LAN | UNVERIFIED | Chờ đồng đội có máy thứ hai. |
+| I · Demo hai máy vật lý trên LAN | PENDING | Kiểm tra trên hai máy vật lý chưa chạy. |
 
 Chính sách giữ history trong RAM vẫn là quyết định còn mở. Hành vi firewall, broadcast qua Wi-Fi và hard link trên filesystem khác cần được đánh giá trong môi trường triển khai.
 
@@ -331,6 +343,16 @@ lan_chat/
 ## 🔧 Xử lý sự cố thường gặp
 
 ### ❌ `ModuleNotFoundError: No module named 'prompt_toolkit'`
+
+Trên Windows, kiểm tra dependency bằng chính interpreter trong venv dùng để chạy app và test:
+
+```powershell
+$Python = Join-Path $PWD.Path '.venv\Scripts\python.exe'
+& $Python -m pip install -r .\requirements.txt
+& $Python -c "import sys, prompt_toolkit; print(sys.executable); print(prompt_toolkit.__version__)"
+```
+
+Trên Linux hoặc macOS:
 
 ```bash
 python3 -m venv .venv

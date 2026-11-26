@@ -17,6 +17,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import Future
+from contextlib import ExitStack, contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Callable
@@ -539,6 +540,30 @@ def _shutdown_workers(
             print_warning("Không thể lưu lịch sử chat.")
 
 
+@contextmanager
+def _interactive_console(parser: argparse.ArgumentParser):
+    console_error = (
+        "lan_chat: an interactive Windows console is required. "
+        "Run from Windows Terminal or PowerShell without redirecting stdin or stdout.\n"
+    )
+    console_errors: tuple[type[Exception], ...] = ()
+    if sys.platform == "win32":
+        if any(stream is None or not stream.isatty() for stream in (sys.stdin, sys.stdout)):
+            parser.exit(2, console_error)
+
+        from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
+
+        console_errors = (NoConsoleScreenBufferError, OSError)
+
+    with ExitStack() as console:
+        try:
+            session = create_prompt_session()
+            console.enter_context(patch_stdout())
+        except console_errors:
+            parser.exit(2, console_error)
+        yield session
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="LAN Chat & File Sharing P2P (Hệ thống mạng đồng đẳng)",
@@ -557,34 +582,32 @@ def main():
         parser.error("--port phải nằm trong khoảng 1–65535.")
     if args.download_quota_gib <= 0:
         parser.error("--download-quota-gib phải là số nguyên dương.")
-    state.download_quota_bytes = args.download_quota_gib * GIB
-    try:
-        state.data_dir = args.data_dir.expanduser().resolve()
-        state.data_dir.mkdir(parents=True, exist_ok=True)
-    except (OSError, RuntimeError) as e:
-        parser.error(f"Không thể mở --data-dir: {e}")
 
-    try:
-        lock_data_directory(state.data_dir)
-    except OSError as e:
-        parser.error(f"Không thể khóa --data-dir '{state.data_dir}'. {e}")
+    with _interactive_console(parser) as session:
+        state.download_quota_bytes = args.download_quota_gib * GIB
+        try:
+            state.data_dir = args.data_dir.expanduser().resolve()
+            state.data_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, RuntimeError) as e:
+            parser.error(f"Không thể mở --data-dir: {e}")
 
-    # 1. Khởi tạo trạng thái danh tính cá nhân
-    state.my_name = normalize_peer_name(args.name)
-    state.my_tcp_port = args.port
-    state.my_ip = get_local_ip()
+        try:
+            lock_data_directory(state.data_dir)
+        except OSError as e:
+            parser.error(f"Không thể khóa --data-dir '{state.data_dir}'. {e}")
 
-    # 2. Tải lịch sử chat đã lưu từ phiên trước
-    loaded_msgs = load_history()
+        # 1. Khởi tạo trạng thái danh tính cá nhân
+        state.my_name = normalize_peer_name(args.name)
+        state.my_tcp_port = args.port
+        state.my_ip = get_local_ip()
 
-    # 3. Tạo session giao diện điều khiển với prompt_toolkit
-    session = create_prompt_session()
+        # 2. Tải lịch sử chat đã lưu từ phiên trước
+        loaded_msgs = load_history()
 
-    def notify_system(message: str):
-        on_tcp_system(message)
-        session.app.invalidate()
+        def notify_system(message: str):
+            on_tcp_system(message)
+            session.app.invalidate()
 
-    with patch_stdout():
         logging.basicConfig(
             level=logging.DEBUG if args.debug else logging.WARNING,
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

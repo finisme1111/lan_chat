@@ -1,15 +1,18 @@
 import asyncio
+import io
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from contextvars import copy_context
 from unittest.mock import patch
 
 from prompt_toolkit.application import create_app_session
 from prompt_toolkit.input.defaults import create_pipe_input
-from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.output import DummyOutput, defaults
 
 import main
+import run_auto_test
 import ui_handler as ui
 from models import SharedState
 
@@ -30,6 +33,30 @@ class UiOutputTest(unittest.TestCase):
             self.assertLogs(main.logger, level="ERROR"),
         ):
             main.on_tcp_message("127.0.0.1:5002", "B", "Chào", True)
+
+    def test_integration_peer_output_handles_a_pipe_in_startup_and_worker(self):
+        output = io.StringIO()
+
+        def notify_from_worker():
+            with create_app_session():
+                ui.print_info("Thông báo từ worker")
+
+        with (
+            create_app_session(),
+            redirect_stdout(output),
+            patch.object(defaults, "create_output", side_effect=RuntimeError("console output unavailable")),
+            patch.object(ui, "print_formatted_text", ui.print_formatted_text),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "console output unavailable"):
+                ui.print_banner()
+
+            run_auto_test._configure_peer_output()
+            ui.print_banner()
+            with ThreadPoolExecutor(max_workers=1) as workers:
+                workers.submit(notify_from_worker).result(timeout=2)
+
+        self.assertIn("LAN Chat & File Sharing P2P", output.getvalue())
+        self.assertIn("Thông báo từ worker", output.getvalue())
 
 
 class HistoryOutputTest(unittest.TestCase):

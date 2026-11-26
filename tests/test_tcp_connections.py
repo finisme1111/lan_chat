@@ -104,6 +104,37 @@ class ChatConnectionsTest(unittest.TestCase):
         arrivals = self.header_at(0, b"MSG|7|") + [(t, b"a") for t in range(9, 64, 9)]
         self.assert_receive_preserves_history(arrivals, 60)
 
+    def test_short_select_waits_preserve_chat_frame_deadlines(self):
+        cases = (
+            ([(0, b"M"), (11, b"S")], 10),
+            ([*self.header_at(0, b"MSG|2|"), (9, b"a"), (20, b"b")], 19),
+            (self.header_at(0, b"MSG|7|") + [(t, b"a") for t in range(9, 64, 9)], 60),
+        )
+        with patch.object(tcp, "_CHAT_READ_SELECT_INTERVAL", 0.1):
+            for arrivals, deadline in cases:
+                with self.subTest(deadline=deadline):
+                    self.assert_receive_preserves_history(arrivals, deadline)
+
+    def test_cancel_pending_chat_read_without_socket_readiness(self):
+        conn = self.make_socket(5001, 61000)
+
+        def select_without_wakeup(readers, writers, errors, timeout):
+            self.assertEqual((readers, writers, errors), ([conn], [], []))
+            self.assertEqual(timeout, 0.1)
+            self.state.stop_event.set()
+            return [], [], []
+
+        with (
+            patch.object(tcp, "_CHAT_READ_SELECT_INTERVAL", 0.1),
+            patch.object(tcp.time, "monotonic", return_value=0),
+            patch.object(tcp.select, "select", side_effect=select_without_wakeup) as wait,
+        ):
+            with self.assertRaises(ConnectionAbortedError):
+                tcp._recv_chat_before(conn, 1, deadline=10)
+        wait.assert_called_once()
+        conn.recv.assert_not_called()
+        conn.settimeout.assert_not_called()
+
     def test_slow_fragmented_utf8_and_back_to_back_frames_are_received(self):
         now, message = self.receive_scheduled([
             (80, b"M"), *self.header_at(89, b"SG|2|"), (98, b"\xc3"), (107, b"\xa9"),

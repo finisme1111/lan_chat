@@ -1,14 +1,73 @@
+import io
 import threading
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
+from types import ModuleType
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import main
 import tcp_handler as tcp
 import ui_handler as ui
 from models import ChatConnection, SharedState
+
+
+class NoConsoleScreenBufferError(Exception):
+    pass
+
+
+class ConsoleStartupTest(unittest.TestCase):
+    def assert_unsupported_console(self, *, stdin_tty=True, stdout_tty=True, failure=None):
+        win32_output = ModuleType("prompt_toolkit.output.win32")
+        win32_output.NoConsoleScreenBufferError = NoConsoleScreenBufferError
+        stderr = io.StringIO()
+        stdout_context = MagicMock()
+        if failure == "patch_stdout":
+            stdout_context.__enter__.side_effect = NoConsoleScreenBufferError()
+        with TemporaryDirectory() as directory, ExitStack() as stack:
+            data_dir = Path(directory) / "must-not-exist"
+            stack.enter_context(patch.object(main.sys, "platform", "win32"))
+            stack.enter_context(patch.dict(main.sys.modules, {"prompt_toolkit.output.win32": win32_output}))
+            stack.enter_context(patch.object(main.sys, "stdin", Mock(isatty=lambda: stdin_tty)))
+            stack.enter_context(patch.object(main.sys, "stdout", Mock(isatty=lambda: stdout_tty)))
+            stack.enter_context(patch.object(main.sys, "stderr", stderr))
+            stack.enter_context(patch.object(main.sys, "argv", [
+                "main.py", "--name", "QA", "--port", "5001", "--data-dir", str(data_dir),
+            ]))
+            create_prompt = stack.enter_context(patch.object(main, "create_prompt_session"))
+            if failure == "prompt":
+                create_prompt.side_effect = NoConsoleScreenBufferError()
+            enter_stdout = stack.enter_context(patch.object(main, "patch_stdout", return_value=stdout_context))
+            lock = stack.enter_context(patch.object(main, "lock_data_directory"))
+            load = stack.enter_context(patch.object(main, "load_history"))
+            get_ip = stack.enter_context(patch.object(main, "get_local_ip"))
+            start_tcp = stack.enter_context(patch.object(main, "start_tcp_threads"))
+            start_udp = stack.enter_context(patch.object(main, "start_udp_threads"))
+
+            with self.assertRaises(SystemExit) as exit_context:
+                main.main()
+
+            self.assertEqual(exit_context.exception.code, 2)
+            self.assertIn("interactive Windows console is required", stderr.getvalue())
+            self.assertIn("Windows Terminal or PowerShell", stderr.getvalue())
+            self.assertFalse(data_dir.exists())
+            self.assertEqual(create_prompt.call_count, int(stdin_tty and stdout_tty))
+            self.assertEqual(enter_stdout.call_count, int(failure == "patch_stdout"))
+            for operation in (lock, load, get_ip, start_tcp, start_udp):
+                operation.assert_not_called()
+
+    def test_windows_rejects_redirected_stdout(self):
+        self.assert_unsupported_console(stdout_tty=False)
+
+    def test_windows_rejects_redirected_stdin(self):
+        self.assert_unsupported_console(stdin_tty=False)
+
+    def test_windows_explains_console_backend_failure_at_session_creation(self):
+        self.assert_unsupported_console(failure="prompt")
+
+    def test_windows_explains_console_backend_failure_entering_stdout_context(self):
+        self.assert_unsupported_console(failure="patch_stdout")
 
 
 class CommandsTest(unittest.TestCase):

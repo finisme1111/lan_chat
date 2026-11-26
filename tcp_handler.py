@@ -66,6 +66,7 @@ CHAT_WRITE_TIMEOUT = 10.0
 CHAT_HEADER_TIMEOUT = 10.0
 CHAT_PAYLOAD_IDLE_TIMEOUT = 10.0
 CHAT_PAYLOAD_TOTAL_TIMEOUT = 60.0
+_CHAT_READ_SELECT_INTERVAL = 0.1 if sys.platform == "win32" else None
 FILE_IO_TIMEOUT = 10.0
 HANDSHAKE_TIMEOUT = 10.0
 MAX_INCOMING_WORKERS = 32
@@ -125,11 +126,26 @@ def _recv_field(sock: socket.socket, deadline: float) -> str:
 
 def _recv_chat_before(sock: socket.socket, size: int, deadline: float) -> bytes:
     # CHAT has one reader and a concurrent writer. Keep the socket mode unchanged.
-    remaining = deadline - time.monotonic()
-    if remaining > 0 and select.select([sock], [], [], remaining)[0]:
+    while True:
+        if state.stop_event.is_set():
+            raise ConnectionAbortedError("Đang đóng ứng dụng.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        wait = remaining
+        if _CHAT_READ_SELECT_INTERVAL is not None:
+            # Winsock shutdown alone may leave an already-blocked select waiting.
+            wait = min(wait, _CHAT_READ_SELECT_INTERVAL)
+        if not select.select([sock], [], [], wait)[0]:
+            continue
+
+        if state.stop_event.is_set():
+            raise ConnectionAbortedError("Đang đóng ứng dụng.")
         chunk = sock.recv(size)
         if time.monotonic() < deadline:
             return chunk
+        break
     raise TimeoutError("Hết thời gian nhận frame CHAT.")
 
 
