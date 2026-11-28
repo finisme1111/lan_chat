@@ -32,7 +32,7 @@ class UiOutputTest(unittest.TestCase):
             patch.object(main, "print_chat", side_effect=RuntimeError("output unavailable")),
             self.assertLogs(main.logger, level="ERROR"),
         ):
-            main.on_tcp_message("127.0.0.1:5002", "B", "Chào", True)
+            main.on_tcp_message("127.0.0.1:5002", "B", "Chào", None)
 
     def test_integration_peer_output_handles_a_pipe_in_startup_and_worker(self):
         output = io.StringIO()

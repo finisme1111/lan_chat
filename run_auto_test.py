@@ -355,15 +355,19 @@ def run_tests(*, use_udp_unicast: bool = sys.platform == "win32"):
             an.expect("Đã kết nối với Quan", start=start)
             start = quan.checkpoint()
             an.send("Tin chưa đọc từ An")
-            quan.expect("Tin nhắn mới từ An: Tin chưa đọc từ An", start=start)
+            quan.expect("Tin nhắn mới từ An: Tin chưa đọc từ An (1 chưa đọc)", start=start)
+            start = quan.checkpoint()
+            an.send("Tin chưa đọc thứ hai từ An")
+            quan.expect("Tin nhắn mới từ An: Tin chưa đọc thứ hai từ An (2 chưa đọc)", start=start)
 
             number, row = list_row(quan, an)
-            if "1 chưa đọc" not in row:
+            if "2 chưa đọc" not in row:
                 raise AssertionError(f"Sai unread counter: {row}")
             start = quan.checkpoint()
             quan.send(f"/chat {number}")
             quan.expect("Lịch sử chat với An", start=start)
             quan.expect("Tin chưa đọc từ An", start=start)
+            quan.expect("Tin chưa đọc thứ hai từ An", start=start)
             _, row = list_row(quan, an)
             if "chưa đọc" in row:
                 raise AssertionError(f"Unread counter chưa được xóa: {row}")

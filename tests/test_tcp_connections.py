@@ -7,7 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 from models import SharedState
+import main
 import tcp_handler as tcp
+import ui_handler as ui
 
 
 class ChatConnectionsTest(unittest.TestCase):
@@ -144,6 +146,90 @@ class ChatConnectionsTest(unittest.TestCase):
         self.assertEqual([call.args[2] for call in message.call_args_list], ["é", "x"])
         self.assertEqual(self.state.unread_counts[self.peer_key], 2)
 
+    def test_unread_notifications_count_messages_independently_for_each_peer(self):
+        other_peer = "127.0.0.1:5003"
+        with (
+            patch.object(tcp, "_msg_cb", main.on_tcp_message),
+            patch.object(tcp, "_system_cb", None),
+            patch.object(main, "print_system") as notice,
+        ):
+            for key, name, contents in (
+                (self.peer_key, "B", [b"tin dau", b"tin thu hai"]),
+                (other_peer, "C", [b"tin khac"]),
+            ):
+                conn = self.make_socket(5001, 61000)
+                self.state.connections[key] = tcp.ChatConnection(conn, outgoing=False)
+                headers = [("MSG", len(text)) for text in contents] + [("BYE", 0)]
+                with (
+                    patch.object(tcp, "_recv_chat_header", side_effect=headers),
+                    patch.object(tcp, "_recv_chat_payload", side_effect=contents),
+                ):
+                    tcp._receiver_loop(conn, key, name)
+
+        self.assertEqual([call.args[0] for call in notice.call_args_list], [
+            "💬 Tin nhắn mới từ B: tin dau (1 chưa đọc)",
+            "💬 Tin nhắn mới từ B: tin thu hai (2 chưa đọc)",
+            "💬 Tin nhắn mới từ C: tin khac (1 chưa đọc)",
+        ])
+        self.assertEqual(self.state.unread_counts, {self.peer_key: 2, other_peer: 1})
+        self.assertEqual(self.state.first_unread, {self.peer_key: 0, other_peer: 0})
+        self.assertEqual({key: len(rows) for key, rows in self.state.chat_history.items()}, {
+            self.peer_key: 2, other_peer: 1,
+        })
+
+    def test_selection_during_notification_keeps_snapshot_and_clears_unread(self):
+        conn = self.make_socket(5001, 61000)
+        self.state.connections[self.peer_key] = tcp.ChatConnection(conn, outgoing=False)
+        notification_started, selection_done = threading.Event(), threading.Event()
+        history_rendered = []
+
+        def deliver(key, name, content, unread_count):
+            if unread_count is not None:
+                notification_started.set()
+                if not selection_done.wait(3):
+                    raise AssertionError("Selection did not complete while the notification was pending")
+            main.on_tcp_message(key, name, content, unread_count)
+
+        def render_history(fragment):
+            history_rendered.append(fragment[1])
+
+        with (
+            patch.object(main, "state", self.state),
+            patch.object(ui, "state", self.state),
+            patch.object(main, "print_info"),
+            patch.object(main, "print_success"),
+            patch.object(main, "print_chat") as chat,
+            patch.object(main, "print_system") as notice,
+            patch.object(ui, "_print_fragments", side_effect=render_history),
+            patch.object(tcp, "_msg_cb", side_effect=deliver) as callback,
+            patch.object(tcp, "_system_cb", None),
+            patch.object(tcp, "_recv_chat_header", side_effect=[("MSG", 3), ("MSG", 3), ("BYE", 0)]),
+            patch.object(tcp, "_recv_chat_payload", side_effect=[b"one", b"two"]),
+            ThreadPoolExecutor(max_workers=1) as workers,
+        ):
+            receiver = workers.submit(tcp._receiver_loop, conn, self.peer_key, "B")
+            try:
+                self.assertTrue(notification_started.wait(2))
+                self.assertTrue(self.state.lock.acquire(blocking=False), "Callback ran under state.lock")
+                try:
+                    self.assertEqual(self.state.unread_counts[self.peer_key], 1)
+                finally:
+                    self.state.lock.release()
+                main.handle_command("/chat B")
+                self.assertEqual(self.state.current_partner, self.peer_key)
+                self.assertEqual(self.state.unread_counts[self.peer_key], 0)
+                self.assertNotIn(self.peer_key, self.state.first_unread)
+            finally:
+                selection_done.set()
+            receiver.result(timeout=3)
+
+        self.assertEqual([call.args[-1] for call in callback.call_args_list], [1, None])
+        notice.assert_called_once_with("💬 Tin nhắn mới từ B: one (1 chưa đọc)")
+        chat.assert_called_once_with("B", "two")
+        self.assertTrue(any(line.endswith("B: one") for line in history_rendered))
+        self.assertEqual(self.state.unread_counts[self.peer_key], 0)
+        self.assertEqual(len(self.state.chat_history[self.peer_key]), 2)
+
     def test_eof_discards_partial_frame_without_waiting_for_deadline(self):
         for header in (b"MS", b"MSG|2|a"):
             with self.subTest(header=header):
@@ -221,6 +307,212 @@ class ChatConnectionsTest(unittest.TestCase):
         self.assertIs(tcp.get_or_connect(self.peer_key), replacement)
         replacement.close.assert_not_called()
         self.assertEqual(self.state.current_partner, self.peer_key)
+
+    def test_incoming_callback_failure_cleans_published_connection(self):
+        conn = self.make_socket(5001, 61000)
+        self.state.reconnect_partner = self.peer_key
+
+        def fail_notification(_notice):
+            self.assertIs(self.state.connections[self.peer_key].sock, conn)
+            self.assertEqual(self.state.current_partner, self.peer_key)
+            raise RuntimeError("reconnect notification failed")
+
+        with (
+            patch.object(tcp, "_recv_field", side_effect=["HELLO", "B", "5002", "CHAT"]),
+            patch.object(tcp, "_system_cb", side_effect=fail_notification) as notify,
+            patch.object(tcp, "_receiver_loop") as receiver,
+            self.assertLogs(tcp.logger, level="ERROR") as logs,
+        ):
+            tcp._handle_incoming(conn, conn.getpeername())
+
+        self.assertIn("reconnect notification failed", logs.output[0])
+        notify.assert_called_once()
+        receiver.assert_not_called()
+        self.assertNotIn(self.peer_key, self.state.connections)
+        self.assertIsNone(self.state.current_partner)
+        self.assertEqual(self.state.reconnect_partner, self.peer_key)
+        conn.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        conn.close.assert_called_once()
+
+    def test_failed_incoming_cleanup_preserves_concurrent_replacement(self):
+        original = self.make_socket(5001, 61000)
+        replacement = self.make_socket(5001, 61001)
+        callback_started, resume_callback = threading.Event(), threading.Event()
+
+        def fail_notification(_notice):
+            callback_started.set()
+            if not resume_callback.wait(3):
+                raise TimeoutError("test did not publish the replacement")
+            raise RuntimeError("incoming notification failed")
+
+        self.state.current_partner = self.state.reconnect_partner = self.peer_key
+        with (
+            patch.object(tcp, "_recv_field", side_effect=["HELLO", "B", "5002", "CHAT"]),
+            patch.object(tcp, "_system_cb", side_effect=fail_notification),
+            patch.object(tcp, "_receiver_loop") as receiver,
+            self.assertLogs(tcp.logger, level="ERROR") as logs,
+        ):
+            self.assertTrue(tcp._start_tcp_worker(
+                original, tcp._handle_incoming, (original.getpeername(),), incoming=True,
+            ))
+            with self.state.conn_lock:
+                worker = self.state.tcp_workers[original][0]
+            try:
+                self.assertTrue(callback_started.wait(3))
+                candidate = tcp.ChatConnection(replacement, outgoing=False)
+                self.assertIs(tcp._register_chat_connection(
+                    self.peer_key, "127.0.0.1", 5002, candidate,
+                ), candidate)
+            finally:
+                resume_callback.set()
+                worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIn("incoming notification failed", logs.output[0])
+        self.assertNotIn(original, self.state.tcp_workers)
+        receiver.assert_not_called()
+        original.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        self.assertIs(tcp.get_or_connect(self.peer_key), replacement)
+        self.assertEqual(self.state.current_partner, self.peer_key)
+        self.assertEqual(self.state.reconnect_partner, self.peer_key)
+        replacement.close.assert_not_called()
+        replacement.shutdown.assert_not_called()
+
+    def test_incoming_receiver_cleans_normally_without_handoff_cleanup(self):
+        conn = self.make_socket(5001, 61000)
+        self.state.current_partner = self.state.reconnect_partner = self.peer_key
+        with (
+            patch.object(tcp, "_recv_field", side_effect=["HELLO", "B", "5002", "CHAT"]),
+            patch.object(tcp, "_system_cb") as notify,
+            patch.object(tcp, "_recv_chat_header", return_value=("BYE", 0)) as read,
+            patch.object(tcp, "_cleanup_connection", wraps=tcp._cleanup_connection) as cleanup,
+        ):
+            tcp._handle_incoming(conn, conn.getpeername())
+
+        self.assertEqual([call.args[0] for call in notify.call_args_list], [
+            "[*] B đã kết nối vào trò chuyện.",
+            "[*] Kết nối với B đã bị ngắt.",
+        ])
+        read.assert_called_once_with(conn)
+        cleanup.assert_called_once_with(self.peer_key, conn)
+        self.assertNotIn(self.peer_key, self.state.connections)
+        self.assertIsNone(self.state.current_partner)
+        self.assertEqual(self.state.reconnect_partner, self.peer_key)
+        conn.close.assert_called_once()
+
+    def test_bye_notifies_once_and_does_not_read_following_eof(self):
+        conn = self.make_socket(5001, 61000)
+        conn.recv.side_effect = [b"B", b"Y", b"E", b"|", b""]
+        self.state.connections[self.peer_key] = tcp.ChatConnection(conn, outgoing=False)
+        self.state.current_partner = self.state.reconnect_partner = self.peer_key
+
+        def check_notice(_notice):
+            self.assertTrue(self.state.conn_lock.acquire(blocking=False))
+            try:
+                self.assertNotIn(self.peer_key, self.state.connections)
+                self.assertIsNone(self.state.current_partner)
+            finally:
+                self.state.conn_lock.release()
+            conn.close.assert_called_once()
+
+        with (
+            patch.object(tcp.select, "select", return_value=([conn], [], [])),
+            patch.object(tcp, "_system_cb", side_effect=check_notice) as notify,
+            patch.object(tcp, "_cleanup_connection", wraps=tcp._cleanup_connection) as cleanup,
+        ):
+            tcp._receiver_loop(conn, self.peer_key, "B")
+
+        self.assertEqual(conn.recv.call_count, 4)
+        cleanup.assert_called_once_with(self.peer_key, conn)
+        notify.assert_called_once_with("[*] Kết nối với B đã bị ngắt.")
+        self.assertEqual(self.state.reconnect_partner, self.peer_key)
+
+    def test_bye_from_replaced_socket_preserves_current_connection(self):
+        original = self.make_socket(5001, 61000)
+        replacement = self.make_socket(5001, 61001)
+        self.state.connections[self.peer_key] = tcp.ChatConnection(original, outgoing=False)
+        self.state.current_partner = self.state.reconnect_partner = self.peer_key
+
+        def recv_bye(_socket):
+            candidate = tcp.ChatConnection(replacement, outgoing=False)
+            self.assertIs(tcp._register_chat_connection(
+                self.peer_key, "127.0.0.1", 5002, candidate,
+            ), candidate)
+            return "BYE", 0
+
+        with (
+            patch.object(tcp, "_recv_chat_header", side_effect=recv_bye),
+            patch.object(tcp, "_system_cb") as notify,
+        ):
+            tcp._receiver_loop(original, self.peer_key, "B")
+
+        notify.assert_not_called()
+        self.assertIs(self.state.connections[self.peer_key].sock, replacement)
+        self.assertEqual(self.state.current_partner, self.peer_key)
+        replacement.shutdown.assert_not_called()
+        replacement.close.assert_not_called()
+
+    def test_bye_suppresses_notice_if_replacement_arrives_while_closing(self):
+        original = self.make_socket(5001, 61000)
+        replacement = self.make_socket(5001, 61001)
+        self.state.connections[self.peer_key] = tcp.ChatConnection(original, outgoing=False)
+        self.state.current_partner = self.state.reconnect_partner = self.peer_key
+
+        def replace_during_close():
+            candidate = tcp.ChatConnection(replacement, outgoing=False)
+            self.assertIs(tcp._register_chat_connection(
+                self.peer_key, "127.0.0.1", 5002, candidate,
+            ), candidate)
+
+        original.close.side_effect = replace_during_close
+        with (
+            patch.object(tcp, "_recv_chat_header", return_value=("BYE", 0)),
+            patch.object(tcp, "_system_cb") as notify,
+        ):
+            tcp._receiver_loop(original, self.peer_key, "B")
+
+        notify.assert_not_called()
+        original.close.assert_called_once()
+        self.assertIs(self.state.connections[self.peer_key].sock, replacement)
+        self.assertEqual(self.state.reconnect_partner, self.peer_key)
+        replacement.close.assert_not_called()
+
+    def test_bye_during_shutdown_cleans_without_notice(self):
+        conn = self.make_socket(5001, 61000)
+        self.state.connections[self.peer_key] = tcp.ChatConnection(conn, outgoing=False)
+        self.state.current_partner = self.peer_key
+
+        def recv_bye(_socket):
+            self.state.stop_event.set()
+            return "BYE", 0
+
+        with (
+            patch.object(tcp, "_recv_chat_header", side_effect=recv_bye),
+            patch.object(tcp, "_system_cb") as notify,
+        ):
+            tcp._receiver_loop(conn, self.peer_key, "B")
+
+        notify.assert_not_called()
+        conn.close.assert_called_once()
+        self.assertNotIn(self.peer_key, self.state.connections)
+        self.assertIsNone(self.state.current_partner)
+
+    def test_eof_and_connection_reset_still_notify_once(self):
+        for error in (None, ConnectionResetError("reset by peer")):
+            with self.subTest(error=error):
+                conn = self.make_socket(5001, 61000)
+                conn.recv.return_value = b""
+                conn.recv.side_effect = error
+                self.state.connections[self.peer_key] = tcp.ChatConnection(conn, outgoing=False)
+                self.state.current_partner = self.peer_key
+
+                with patch.object(tcp, "_system_cb") as notify:
+                    tcp._receiver_loop(conn, self.peer_key, "B")
+
+                notify.assert_called_once_with("[*] Kết nối với B đã bị ngắt.")
+                conn.close.assert_called_once()
+                self.assertNotIn(self.peer_key, self.state.connections)
+                self.assertIsNone(self.state.current_partner)
 
     def test_simultaneous_dials_keep_same_physical_connection(self):
         a_outgoing = self.make_socket(61000, 5002)

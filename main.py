@@ -27,7 +27,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from data_dir_lock import lock_data_directory
 from history import load_history, start_autosave_thread
 from models import DEFAULT_DOWNLOAD_QUOTA_GIB, GIB, Peer, state
-from protocol import MAX_MSG_LEN, UDP_PORT, normalize_peer_name
+from protocol import MAX_MSG_LEN, MAX_UDP_DATAGRAM, PRESENCE_STATUSES, UDP_PORT, encode_hello, normalize_peer_name
 from tcp_handler import (
     FileSendResult,
     close_chat_connections,
@@ -95,17 +95,17 @@ def get_local_ip() -> str:
 # Callbacks từ TCP handler đưa dữ liệu lên UI
 # ---------------------------------------------------------------------------
 
-def on_tcp_message(peer_key: str, peer_name: str, content: str, is_current: bool):
+def on_tcp_message(peer_key: str, peer_name: str, content: str, unread_count: int | None):
     """
     Hiển thị tin nhắn nhận được.
     patch_stdout đảm bảo tin nhắn không đè lên dòng lệnh đang gõ.
     """
     try:
-        if is_current:
+        if unread_count is None:
             print_chat(peer_name, content)
         else:
             preview = content if len(content) <= 45 else content[:45] + "..."
-            print_system(f"💬 Tin nhắn mới từ {peer_name}: {preview}")
+            print_system(f"💬 Tin nhắn mới từ {peer_name}: {preview} ({unread_count} chưa đọc)")
     except Exception:
         logger.exception("Không thể hiển thị tin nhắn từ %s.", peer_key)
 
@@ -149,8 +149,7 @@ def _make_send_file_progress(filename: str):
 
 def _find_peer(selector: str):
     if not selector:
-        print_warning("Cú pháp: /chat <tên|số> (Gõ /list để xem số)")
-        return None, None
+        return None, None, "Cú pháp: /chat <tên|số> (Gõ /list để xem số)"
     peers = state.get_peer_list_snapshot()
     if selector.isascii() and selector.isdecimal():
         with state.lock:
@@ -160,19 +159,17 @@ def _find_peer(selector: str):
         except ValueError:
             index = -1
         if 0 <= index < len(listed) and listed[index] in peers:
-            return listed[index], peers[listed[index]]
-        print_warning("Số peer không hợp lệ hoặc peer đã offline. Gõ /list để cập nhật.")
-        return None, None
+            return listed[index], peers[listed[index]], None
+        return None, None, "Số peer không hợp lệ hoặc peer đã offline. Gõ /list để cập nhật."
 
     name = selector.casefold()
     matches = [(key, peer) for key, peer in peers.items() if peer.name.casefold() == name]
     if len(matches) == 1:
-        return matches[0]
+        key, peer = matches[0]
+        return key, peer, None
     if matches:
-        print_warning("Có nhiều peer trùng tên. Gõ /list và chọn số của peer.")
-    else:
-        print_warning(f"Không tìm thấy người dùng '{selector}'. Gõ /list để xem danh sách online.")
-    return None, None
+        return None, None, "Có nhiều peer trùng tên. Gõ /list và chọn số của peer."
+    return None, None, f"Không tìm thấy người dùng '{selector}'. Gõ /list để xem danh sách online."
 
 
 def _send_chat_text(content: str):
@@ -197,7 +194,20 @@ def _send_chat_text(content: str):
     print_chat(f"{state.my_name} (bạn)", content, is_self=True)
 
 
-def _open_chat(peer_key: str, peer: Peer) -> bool:
+def _open_chat(
+    peer_key: str | None, peer: Peer | None, lookup_error: str | None,
+    *, can_activate: Callable[[], bool] | None = None,
+) -> bool:
+    with state.lock:
+        if can_activate is not None and not can_activate():
+            return False
+        state.current_partner = None
+        state.reconnect_partner = None
+
+    if peer_key is None or peer is None:
+        print_warning(lookup_error or "Không thể chọn peer.")
+        return False
+
     print_info(f"Đang kết nối tới {peer.name} ({peer.ip}:{peer.tcp_port})...")
     if get_or_connect(peer_key) is None:
         print_error(f"Không thể kết nối TCP tới {peer.name}. Đối tác có thể vừa offline hoặc bị chặn tường lửa.")
@@ -205,6 +215,8 @@ def _open_chat(peer_key: str, peer: Peer) -> bool:
 
     with state.conn_lock:
         with state.lock:
+            if can_activate is not None and not can_activate():
+                return False
             connected = peer_key in state.connections and peer_key in state.peer_list
             if connected:
                 state.current_partner = peer_key
@@ -292,30 +304,48 @@ def _start_command_worker(name: str, capacity: int, payload_budget: int):
 
 def _start_chat_worker():
     worker, enqueue, cancel_pending = _start_command_worker("Chat-Commands", 64, CHAT_QUEUE_BYTES)
-    pending_selection: Future[bool] | None = None
+    latest_selection: Future[bool] | None = None
+    rejected_selection_version = 0
 
-    def submit(command: str, job: Callable[[], bool], payload_bytes: int) -> bool:
-        nonlocal pending_selection
+    def submit(command: str, job: Callable[..., bool], payload_bytes: int) -> bool:
+        nonlocal latest_selection, rejected_selection_version
         selection = Future() if command == "/chat" else None
-        depends_on = pending_selection if command in ("", "/send", "/file") else None
-        if depends_on is not None and depends_on.done():
-            depends_on = None
+        depends_on = latest_selection if command in ("", "/send", "/file") else None
+        version = rejected_selection_version
+
+        def can_activate():
+            # Called under state.lock when the worker changes the active peer.
+            return version == rejected_selection_version
 
         def execute():
+            if selection is None:
+                if depends_on is not None and not depends_on.result():
+                    print_warning("Lệnh gửi đã bị bỏ qua. Dùng /chat để chọn lại peer hoặc /leave để rời chat.")
+                else:
+                    job()
+                return
+
             succeeded = False
             try:
-                if depends_on is not None and not depends_on.result():
-                    print_warning("Chưa kết nối được peer đã chọn. Lệnh gửi đã bị bỏ qua.")
-                else:
-                    succeeded = job()
+                succeeded = job(can_activate=can_activate)
             finally:
-                if selection is not None:
-                    selection.set_result(succeeded)
+                if not succeeded:
+                    with state.lock:
+                        state.current_partner = None
+                        state.reconnect_partner = None
+                selection.set_result(succeeded)
 
         if not enqueue(execute, payload_bytes):
+            if selection is not None:
+                with state.lock:
+                    rejected_selection_version += 1
+                    state.current_partner = None
+                    state.reconnect_partner = None
+                selection.set_result(False)
+                latest_selection = selection
             return False
         if selection is not None or command == "/leave":
-            pending_selection = selection
+            latest_selection = selection
         return True
 
     return worker, submit, cancel_pending
@@ -362,7 +392,7 @@ def _broadcast_text(content: str):
 
 def handle_command(
     cmd_raw: str,
-    submit_chat: Callable[[str, Callable[[], bool], int], bool] | None = None,
+    submit_chat: Callable[[str, Callable[..., bool], int], bool] | None = None,
     submit_broadcast: Callable[[Callable[[], None], int], bool] | None = None,
 ) -> bool:
     """
@@ -377,12 +407,11 @@ def handle_command(
     command = parts[0].lower() if cmd.startswith("/") else ""
     args = parts[1].strip() if len(parts) > 1 else ""
     if command == "/chat":
-        peer_key, peer = _find_peer(args)
-        if peer is not None:
-            if submit_chat is None:
-                _open_chat(peer_key, peer)
-            elif not submit_chat(command, partial(_open_chat, peer_key, peer), 0):
-                print_warning("Hàng đợi chat đang đầy. Vui lòng thử lại.")
+        selection = partial(_open_chat, *_find_peer(args))
+        if submit_chat is None:
+            selection()
+        elif not submit_chat(command, selection, 0):
+            print_warning("Hàng đợi chat đang đầy. Dùng /chat để chọn lại peer hoặc /leave để rời chat.")
         return False
 
     if submit_chat is not None and (
@@ -408,10 +437,11 @@ def handle_command(
 
     # ------------------ /status ------------------
     elif command == "/status":
-        if args not in ("online", "available", "busy", "away"):
+        status = "available" if args == "online" else args
+        if status not in PRESENCE_STATUSES:
             print_warning("Cú pháp: /status <online|away>")
         else:
-            state.set_status("available" if args == "online" else args)
+            state.set_status(status)
             print_success(f"Đã cập nhật trạng thái cá nhân: '{args}'.")
 
     # ------------------ /history ------------------
@@ -583,6 +613,14 @@ def main():
     if args.download_quota_gib <= 0:
         parser.error("--download-quota-gib phải là số nguyên dương.")
 
+    name = normalize_peer_name(args.name)
+    if any(
+        len(encode_hello(name, args.port, status, instance_id)) > MAX_UDP_DATAGRAM
+        for status in PRESENCE_STATUSES
+        for instance_id in (None, state.instance_id)
+    ):
+        parser.error(f"--name quá dài. Gói UDP discovery sau khi mã hóa UTF-8 tối đa {MAX_UDP_DATAGRAM} byte.")
+
     with _interactive_console(parser) as session:
         state.download_quota_bytes = args.download_quota_gib * GIB
         try:
@@ -597,7 +635,7 @@ def main():
             parser.error(f"Không thể khóa --data-dir '{state.data_dir}'. {e}")
 
         # 1. Khởi tạo trạng thái danh tính cá nhân
-        state.my_name = normalize_peer_name(args.name)
+        state.my_name = name
         state.my_tcp_port = args.port
         state.my_ip = get_local_ip()
 
@@ -627,7 +665,7 @@ def main():
             )
         except (OSError, RuntimeError) as e:
             print_error(f"Không thể mở TCP port {state.my_tcp_port}: {e}")
-            return
+            raise SystemExit(1) from None
         print_success(f"Máy chủ TCP đang lắng nghe trên cổng {state.my_tcp_port}.")
 
         workers = [t_tcp, t_reconnect]

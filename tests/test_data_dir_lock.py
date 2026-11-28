@@ -26,6 +26,9 @@ mode = sys.argv.pop(1)
 main._interactive_console = lambda _: nullcontext(Mock(prompt=lambda _: "/quit"))
 main.get_local_ip = lambda: "127.0.0.1"
 
+if mode == "interrupt":
+    main._interactive_console = lambda _: nullcontext(Mock(prompt=Mock(side_effect=KeyboardInterrupt)))
+
 if mode == "reject":
     main.load_history = Mock(side_effect=AssertionError("history read before lock"))
     main.get_local_ip = Mock(side_effect=AssertionError("network initialized before lock"))
@@ -36,7 +39,7 @@ def start_tcp(**_):
     if mode == "hold":
         print("OWNER_READY", flush=True)
         input()
-    if mode != "writer":
+    if mode not in ("interrupt", "writer"):
         raise OSError("simulated startup failure")
     threads = [threading.Thread(target=main.state.stop_event.wait) for _ in range(2)]
     for thread in threads:
@@ -63,6 +66,50 @@ if mode == "writer":
     print("OWNER_READY", flush=True)
     input()
     release.set()
+"""
+
+
+_BIND_FAILURE_DRIVER = """
+import errno
+import runpy
+import socket
+import sys
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
+
+import prompt_toolkit.patch_stdout as prompt_stdout
+import udp_handler
+import ui_handler
+from prompt_toolkit.application import create_app_session
+from prompt_toolkit.output.plain_text import PlainTextOutput
+
+udp_probe = Mock()
+udp_probe.getsockname.return_value = ("127.0.0.1", 0)
+listener = Mock()
+listener.bind.side_effect = OSError(errno.EADDRINUSE, "simulated TCP bind failure")
+start_udp = Mock(side_effect=AssertionError("UDP started after TCP startup failure"))
+
+def open_socket(family, kind):
+    assert family == socket.AF_INET
+    return udp_probe if kind == socket.SOCK_DGRAM else listener
+
+with (
+    patch.object(sys, "stdin", Mock(spec=["isatty"], isatty=lambda: True)),
+    patch.object(sys.stdout, "isatty", return_value=True),
+    create_app_session(output=PlainTextOutput(sys.stdout)),
+    patch.object(ui_handler, "create_prompt_session"),
+    patch.object(prompt_stdout, "patch_stdout", nullcontext),
+    patch.object(socket, "socket", side_effect=open_socket),
+    patch.object(udp_handler, "start_udp_threads", start_udp),
+):
+    try:
+        runpy.run_module("main", run_name="__main__", alter_sys=True)
+    except SystemExit as exit_error:
+        if exit_error.code == 1:
+            listener.bind.assert_called_once()
+            listener.close.assert_called_once_with()
+            start_udp.assert_not_called()
+        raise
 """
 
 
@@ -122,8 +169,28 @@ class DataDirectoryLockTest(unittest.TestCase):
 
     def assert_startup_failure_reported(self, folder=None):
         result = self.run_cli("startup-failure", folder)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("simulated startup failure", result.stdout)
+
+    def test_tcp_bind_failure_has_nonzero_exit_and_releases_data_directory(self):
+        command = [
+            sys.executable, "-B", "-u", "-c", _BIND_FAILURE_DRIVER,
+            "--name", "QA", "--port", "5001", "--data-dir", str(self.directory),
+        ]
+        result = subprocess.run(
+            command, cwd=self.cwd, env=self.env, capture_output=True, encoding="utf-8", timeout=6,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Không thể mở TCP port 5001", result.stdout)
+        self.assertIn("simulated TCP bind failure", result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assert_startup_failure_reported()
+
+    def test_ctrl_c_at_prompt_has_zero_exit(self):
+        result = self.run_cli("interrupt")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Ctrl+C", result.stdout)
+        self.assert_startup_failure_reported()
 
     def test_rejects_resolved_alias_before_touching_history_or_network(self):
         history_file = self.directory / "chat_history.json"
@@ -140,7 +207,7 @@ class DataDirectoryLockTest(unittest.TestCase):
         self.assert_startup_failure_reported(other)
         self.assertTrue((other / LOCK_FILENAME).is_file())
         owner.communicate("\n", timeout=6)
-        self.assertEqual(owner.returncode, 0)
+        self.assertEqual(owner.returncode, 1)
         self.assert_startup_failure_reported()
         self.assertTrue((self.directory / LOCK_FILENAME).is_file())
 

@@ -33,7 +33,7 @@ class FileSenderTest(unittest.TestCase):
         stack.enter_context(patch.object(tcp, "state", self.state))
         stack.enter_context(patch.object(tcp, "_file_sender", None))
         stack.enter_context(patch.object(tcp, "_file_sender_socket", None))
-        stack.enter_context(patch.object(tcp.socket, "socket", return_value=self.sock))
+        self.socket_factory = stack.enter_context(patch.object(tcp.socket, "socket", return_value=self.sock))
         self.addCleanup(self.stop_sender)
 
     def stop_sender(self):
@@ -114,6 +114,43 @@ class FileSenderTest(unittest.TestCase):
                     worker.join(timeout=1)
         self.assertEqual(results, [tcp.FileSendResult.FAILED])
         self.sock.connect_ex.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX byte filenames required")
+    def test_unencodable_filename_fails_before_opening_a_socket(self):
+        name = os.fsdecode(b"nguon-\xff.bin")
+        if not any(0xD800 <= ord(character) <= 0xDFFF for character in name):
+            self.skipTest("Filesystem decoding does not produce a surrogate for this byte fixture")
+        path = self.path.with_name(name)
+        path.write_bytes(b"abc")
+        done, progress = Mock(), Mock()
+        with (
+            path.open("rb") as source,
+            patch.object(tcp, "open", return_value=source, create=True),
+            patch.object(threading, "excepthook") as worker_error,
+            self.assertLogs(tcp.logger, level="ERROR") as logs,
+        ):
+            self.assertTrue(tcp.start_file_send(self.peer_key, str(path), progress, done))
+            tcp._file_sender.join(timeout=2)
+            self.assertFalse(tcp._file_sender.is_alive())
+            self.assertTrue(source.closed)
+
+        done.assert_called_once_with(tcp.FileSendResult.FAILED)
+        self.assertIn("UTF-8", logs.output[0])
+        progress.assert_not_called()
+        self.socket_factory.assert_not_called()
+        worker_error.assert_not_called()
+        self.assertIsNone(tcp._file_sender_socket)
+
+    def test_unicode_filename_is_transmitted_as_utf8(self):
+        path = self.path.with_name("tệp tiếng Việt.bin")
+        path.write_bytes(b"abc")
+        self.sock.recv.side_effect = [bytes([value]) for value in b"FILE_ACK|1|OK|"]
+
+        self.assertIs(tcp.send_file(self.peer_key, str(path)), tcp.FileSendResult.SAVED)
+        self.assertEqual(
+            [call.args[0] for call in self.sock.sendall.call_args_list],
+            [b"HELLO|A|5001|FILE|", "FILE|tệp tiếng Việt.bin|3|".encode("utf-8"), b"abc"],
+        )
 
     def test_only_supported_success_ack_confirms_save(self):
         for response, expected in (

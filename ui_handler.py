@@ -125,6 +125,7 @@ HELP_TEXT = """
 │  Nhập nội dung      Gửi tin nhắn đến peer hiện tại    │
 │  /history           Xem lại lịch sử chat               │
 │  /leave             Rời chat (giữ kết nối TCP)         │
+│  /broadcast <nội dung>  Gửi tin tới mọi peer online    │
 ├─ Lệnh File ───────────────────────────────────────────┤
 │  /send <tệp>        Gửi file (/file là alias)          │
 ├─ Chung ───────────────────────────────────────────────┤

@@ -1,7 +1,8 @@
 import io
 import threading
 import unittest
-from contextlib import ExitStack
+from collections import deque
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import ModuleType
 from tempfile import TemporaryDirectory
@@ -11,6 +12,7 @@ import main
 import tcp_handler as tcp
 import ui_handler as ui
 from models import ChatConnection, SharedState
+from protocol import MAX_UDP_DATAGRAM, decode_hello, encode_hello
 
 
 class NoConsoleScreenBufferError(Exception):
@@ -70,6 +72,70 @@ class ConsoleStartupTest(unittest.TestCase):
         self.assert_unsupported_console(failure="patch_stdout")
 
 
+class DiscoveryNameStartupTest(unittest.TestCase):
+    def assert_name_boundary(self, character, port):
+        state = SharedState()
+        overhead = len(f"HELLO2||{port}|available|{state.instance_id}".encode("utf-8"))
+        remaining = MAX_UDP_DATAGRAM - overhead - 1  # The leading normalized underscore.
+        count, extra = divmod(remaining, len(character.encode("utf-8")))
+        name = "_" + character * count + "x" * extra
+        raw_name = "  |" + name[1:] + "  "
+
+        with TemporaryDirectory() as directory, ExitStack() as stack:
+            argv = [
+                "main.py", "--name", raw_name.strip() + "x", "--port", str(port),
+                "--data-dir", str(Path(directory) / "data"),
+            ]
+            stack.enter_context(patch.object(main, "state", state))
+            stack.enter_context(patch.object(main.sys, "argv", argv))
+            stderr = stack.enter_context(patch.object(main.sys, "stderr", io.StringIO()))
+            console = stack.enter_context(
+                patch.object(main, "_interactive_console", return_value=nullcontext(Mock())),
+            )
+            lock = stack.enter_context(patch.object(main, "lock_data_directory"))
+            get_ip = stack.enter_context(patch.object(main, "get_local_ip", return_value="127.0.0.1"))
+            start_tcp = stack.enter_context(
+                patch.object(main, "start_tcp_threads", side_effect=OSError("stop at TCP initialization")),
+            )
+            start_udp = stack.enter_context(patch.object(main, "start_udp_threads"))
+            stack.enter_context(patch.object(main, "load_history", return_value=0))
+            for function in ("print_banner", "print_info", "print_help", "print_error"):
+                stack.enter_context(patch.object(main, function))
+
+            with self.assertRaises(SystemExit) as oversized:
+                main.main()
+            self.assertEqual(oversized.exception.code, 2)
+            self.assertIn("--name quá dài", stderr.getvalue())
+            self.assertFalse(Path(argv[-1]).exists())
+            for operation in (console, lock, get_ip, start_tcp, start_udp):
+                operation.assert_not_called()
+
+            argv[2] = raw_name
+            with self.assertRaises(SystemExit) as boundary:
+                main.main()
+            self.assertEqual(boundary.exception.code, 1)
+            start_tcp.assert_called_once()
+            self.assertEqual(state.my_name, name)
+
+        for status in ("available", "away", "busy"):
+            for instance in (None, state.instance_id):
+                with self.subTest(status=status, instance=instance):
+                    packet = encode_hello(state.my_name, port, status, instance)
+                    self.assertLessEqual(len(packet), MAX_UDP_DATAGRAM)
+                    self.assertEqual(decode_hello(packet)["name"], name)
+                    self.assertEqual(decode_hello(packet)["status"], status)
+        self.assertEqual(len(encode_hello(name, port, "available", state.instance_id)), MAX_UDP_DATAGRAM)
+        self.assertIsNone(decode_hello(encode_hello(name + "x", port, "available", state.instance_id)))
+        self.assertIsNotNone(decode_hello(encode_hello(name + "x", port, "away", state.instance_id)))
+        self.assertIsNotNone(decode_hello(encode_hello(name + "x", port, "available")))
+
+    def test_ascii_name_at_discovery_datagram_boundary(self):
+        self.assert_name_boundary("a", 65535)
+
+    def test_multibyte_name_at_discovery_datagram_boundary(self):
+        self.assert_name_boundary("ệ", 5001)
+
+
 class CommandsTest(unittest.TestCase):
     def setUp(self):
         self.state = SharedState()
@@ -81,6 +147,26 @@ class CommandsTest(unittest.TestCase):
         for name in ("print_chat", "print_info", "print_success", "display_chat_history", "display_peer_list"):
             stack.enter_context(patch.object(main, name))
         self.warning = stack.enter_context(patch.object(main, "print_warning"))
+
+    def test_help_lists_supported_commands_and_broadcast_sends_to_all_online_peers(self):
+        other_peer = "127.0.0.1:5003"
+        self.state.upsert_peer("C", "127.0.0.1", 5003, "away")
+        with patch.object(ui, "_print_fragments") as output:
+            self.assertFalse(main.handle_command("/help"))
+
+        output.assert_called_once()
+        help_text = output.call_args.args[0][1]
+        for command in ("/list", "/chat", "/send", "/leave", "/status", "/help", "/quit"):
+            with self.subTest(command=command):
+                self.assertIn(command, help_text)
+        self.assertIn("/broadcast <nội dung>  Gửi tin tới mọi peer online", help_text)
+
+        with patch.object(main, "send_chat_message", return_value=True) as send:
+            self.assertFalse(main.handle_command("/broadcast nội dung thử"))
+        self.assertEqual([call.args for call in send.call_args_list], [
+            (self.peer_key, "[Broadcast] nội dung thử"),
+            (other_peer, "[Broadcast] nội dung thử"),
+        ])
 
     def test_chat_number_selects_the_peer_from_last_list(self):
         self.state.upsert_peer("C", "127.0.0.1", 5003, "available")
@@ -230,7 +316,8 @@ class CommandsTest(unittest.TestCase):
                 let_connect_fail.set()
                 self.assertTrue(skipped.wait(1))
                 send_text.assert_not_called()
-                self.assertEqual(self.state.current_partner, "127.0.0.1:5003")
+                self.assertIsNone(self.state.current_partner)
+                self.assertIsNone(self.state.reconnect_partner)
             finally:
                 self.state.stop_event.set()
                 let_connect_fail.set()
@@ -324,6 +411,166 @@ class CommandsTest(unittest.TestCase):
         self.warning.assert_called_once_with(
             "Đã dừng broadcast khi đóng ứng dụng. Đã gửi tới 1/2 người dùng."
         )
+
+
+class ChatSelectionTest(unittest.TestCase):
+    send_commands = ("tin chưa được gửi", "/send rejected.bin", "/file rejected.bin")
+
+    def setUp(self):
+        self.state = SharedState()
+        self.state.my_name = "QA"
+        self.peer_a = "127.0.0.1:5001"
+        self.peer_b = "127.0.0.1:5002"
+        self.peer_c = "127.0.0.1:5003"
+        for name, port in (("A", 5001), ("B", 5002), ("C", 5003)):
+            self.state.upsert_peer(name, "127.0.0.1", port, "available")
+        self.socket_a = Mock()
+        self.state.connections[self.peer_a] = ChatConnection(self.socket_a, outgoing=True)
+        self.state.current_partner = self.state.reconnect_partner = self.peer_a
+        self.state.chat_history[self.peer_a] = ["tin có sẵn"]
+        self.jobs = deque()
+        self.reject_next = False
+
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(main, "state", self.state))
+        stack.enter_context(patch.object(ui, "state", self.state))
+        stack.enter_context(patch.object(main.os.path, "isfile", return_value=True))
+        for name in ("print_info", "print_error", "print_success", "print_chat", "display_chat_history"):
+            stack.enter_context(patch.object(main, name))
+        self.warning = stack.enter_context(patch.object(main, "print_warning"))
+        self.connect = stack.enter_context(patch.object(main, "get_or_connect", side_effect=self.available_socket))
+        self.send_text = stack.enter_context(patch.object(main, "send_chat_message", return_value=True))
+        self.send_file = stack.enter_context(patch.object(main, "start_file_send", return_value=True))
+        with patch.object(main, "_start_command_worker", return_value=(None, self.enqueue, None)):
+            _, self.submit, _ = main._start_chat_worker()
+
+    def enqueue(self, job, _payload_bytes):
+        if self.reject_next:
+            self.reject_next = False
+            return False
+        self.jobs.append(job)
+        return True
+
+    def available_socket(self, key):
+        connection = self.state.connections.get(key)
+        return connection.sock if connection else None
+
+    def enter(self, *commands):
+        for command in commands:
+            main.handle_command(command, self.submit)
+
+    def drain(self):
+        while self.jobs:
+            self.jobs.popleft()()
+
+    def assert_no_target(self):
+        self.assertIsNone(self.state.current_partner)
+        self.assertIsNone(self.state.reconnect_partner)
+        self.assertEqual(ui.get_prompt_text(), "[QA|online]> ")
+        self.assertIs(self.state.connections[self.peer_a].sock, self.socket_a)
+        self.socket_a.close.assert_not_called()
+        self.socket_a.shutdown.assert_not_called()
+
+    def assert_all_sends_blocked(self):
+        self.send_text.assert_not_called()
+        self.send_file.assert_not_called()
+        self.assertEqual(self.state.chat_history, {self.peer_a: ["tin có sẵn"]})
+        blocked = [call for call in self.warning.call_args_list if "Lệnh gửi đã bị bỏ qua" in call.args[0]]
+        self.assertEqual(len(blocked), len(self.send_commands))
+        self.assert_no_target()
+
+    def test_pending_failed_selection_blocks_text_send_and_file(self):
+        self.enter("/chat B", *self.send_commands)
+        self.drain()
+        self.assert_all_sends_blocked()
+
+    def test_completed_failed_selection_blocks_text_send_and_file(self):
+        self.enter("/chat B")
+        self.drain()
+        self.assert_no_target()
+        self.enter(*self.send_commands)
+        self.drain()
+        self.assert_all_sends_blocked()
+
+    def test_successful_selection_routes_only_to_b(self):
+        self.state.connections[self.peer_b] = ChatConnection(Mock(), outgoing=True)
+        self.enter("/chat B", "tin mới", "/send new.bin", "/file another.bin")
+        self.drain()
+
+        self.send_text.assert_called_once_with(self.peer_b, "tin mới")
+        self.assertEqual([call.args[:2] for call in self.send_file.call_args_list], [
+            (self.peer_b, "new.bin"), (self.peer_b, "another.bin"),
+        ])
+        self.assertEqual(ui.get_prompt_text(), "[QA|online → B]> ")
+        self.assertEqual(self.state.chat_history[self.peer_a], ["tin có sẵn"])
+
+    def test_reselecting_a_after_failure_does_not_replay_blocked_sends(self):
+        self.enter("/chat B", *self.send_commands, "/chat A", "tin mới cho A", "/send new.bin")
+        self.drain()
+        self.send_text.assert_called_once_with(self.peer_a, "tin mới cho A")
+        self.send_file.assert_called_once()
+        self.assertEqual(self.send_file.call_args.args[:2], (self.peer_a, "new.bin"))
+        self.assertEqual(len(self.state.chat_history[self.peer_a]), 2)
+        self.assertEqual(ui.get_prompt_text(), "[QA|online → A]> ")
+        self.socket_a.close.assert_not_called()
+
+    def test_leave_after_failure_restores_normal_no_selection_behavior(self):
+        self.enter("/chat B")
+        self.drain()
+        self.enter("/leave", *self.send_commands)
+        self.drain()
+
+        warnings = [call.args[0] for call in self.warning.call_args_list]
+        self.assertTrue(any("Chưa chọn đối tác" in message for message in warnings))
+        self.assertEqual(sum("Chưa chọn người nhận file" in message for message in warnings), 2)
+        self.assertFalse(any("Lệnh gửi đã bị bỏ qua" in message for message in warnings))
+        self.send_text.assert_not_called()
+        self.send_file.assert_not_called()
+        self.assertEqual(self.state.chat_history, {self.peer_a: ["tin có sẵn"]})
+        self.assert_no_target()
+
+    def test_rapid_selections_keep_each_send_bound_to_its_attempt(self):
+        self.state.connections[self.peer_c] = ChatConnection(Mock(), outgoing=True)
+        self.enter(
+            "/chat B", *self.send_commands,
+            "/chat C", "tin cho C", "/send for-c.bin",
+            "/chat B", "không gửi sang C", "/file not-for-c.bin",
+        )
+        self.drain()
+
+        self.send_text.assert_called_once_with(self.peer_c, "tin cho C")
+        self.send_file.assert_called_once()
+        self.assertEqual(self.send_file.call_args.args[:2], (self.peer_c, "for-c.bin"))
+        self.assertEqual(len(self.state.chat_history[self.peer_c]), 1)
+        self.assertEqual(self.state.chat_history[self.peer_a], ["tin có sẵn"])
+        self.assertNotIn(self.peer_b, self.state.chat_history)
+        self.assert_no_target()
+
+    def test_unknown_peer_selection_fails_closed(self):
+        self.enter("/chat Missing", *self.send_commands)
+        self.drain()
+        self.connect.assert_not_called()
+        self.assert_all_sends_blocked()
+
+    def test_queue_refusal_invalidates_an_in_flight_selection(self):
+        socket_b = Mock()
+
+        def connect(key):
+            self.assertEqual(key, self.peer_b)
+            self.reject_next = True
+            self.enter("/chat C", *self.send_commands)
+            self.assert_no_target()
+            self.state.connections[key] = ChatConnection(socket_b, outgoing=True)
+            return socket_b
+
+        self.connect.side_effect = connect
+        self.enter("/chat B")
+        self.drain()
+        self.assert_all_sends_blocked()
+        self.assertIs(self.state.connections[self.peer_b].sock, socket_b)
+        socket_b.close.assert_not_called()
+        self.assertTrue(any("Hàng đợi chat đang đầy" in call.args[0] for call in self.warning.call_args_list))
 
 
 class QueueBudgetTest(unittest.TestCase):
