@@ -25,8 +25,9 @@ def on_cursor_change(buffer):
 
 def receive():
     if draft_ready.wait(5):
-        main.on_tcp_message("minh", "Minh", "PTY active message", True)
-        main.on_tcp_message("an", "An", "PTY unread message", False)
+        main.on_tcp_message("minh", "Minh", "PTY active message", None)
+        main.on_tcp_message("an", "An", "PTY unread message", 1)
+        main.on_tcp_message("an", "An", "PTY second unread message", 2)
 
 session.default_buffer.on_cursor_position_changed += on_cursor_change
 with patch_stdout():
@@ -83,7 +84,8 @@ class TerminalRedrawTest(unittest.TestCase):
                     expect("QA_PROMPT>")
                     os.write(master, b"abcd\x1b[D\x1b[D")
                     expect("PTY active message")
-                    expect("Tin nhắn mới từ An: PTY unread message")
+                    expect("Tin nhắn mới từ An: PTY unread message (1 chưa đọc)")
+                    expect("Tin nhắn mới từ An: PTY second unread message (2 chưa đọc)")
                     os.write(master, b"X\r")
                     expect("QA_RESULT abXcd")
                     self.assertIn(b"\x1b[", output, "Expected ANSI terminal output")

@@ -27,6 +27,7 @@ UDP_LOOPBACK_ADDR = "127.255.255.255"
 UDP_BROADCAST_INTERVAL = 3.0
 PEER_TIMEOUT = 10.0
 MAX_UDP_DATAGRAM = 2048
+PRESENCE_STATUSES = ("available", "busy", "away")
 
 DELIMITER = "|"
 
@@ -50,6 +51,7 @@ __all__ = [
     "UDP_BROADCAST_INTERVAL",
     "PEER_TIMEOUT",
     "MAX_UDP_DATAGRAM",
+    "PRESENCE_STATUSES",
     "DELIMITER",
     "MAX_FIELD_LEN",
     "MAX_MSG_LEN",
@@ -107,7 +109,7 @@ def decode_hello(data: bytes) -> Optional[Dict[str, Any]]:
             return None
 
         status = parts[3].strip().lower()
-        if status not in ("available", "busy", "away"):
+        if status not in PRESENCE_STATUSES:
             status = "available"
 
         result = {

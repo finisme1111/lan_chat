@@ -125,6 +125,7 @@ HELP_TEXT = """
 │  Nhập nội dung      Gửi tin nhắn đến peer hiện tại    │
 │  /history           Xem lại lịch sử chat               │
 │  /leave             Rời chat (giữ kết nối TCP)         │
+│  /broadcast <nội dung>  Gửi tin tới mọi peer online    │
 ├─ Lệnh File ───────────────────────────────────────────┤
 │  /send <tệp>        Gửi file (/file là alias)          │
 ├─ Chung ───────────────────────────────────────────────┤
@@ -194,23 +195,24 @@ def display_chat_history(peer_key: str, last_n: int = 20):
         last_n:   Số tin gần nhất cần hiển thị, mở rộng khi còn nhiều tin chưa đọc.
     """
     with state.lock:
-        history = list(state.chat_history.get(peer_key, []))
+        history = state.chat_history.get(peer_key, [])
+        total = len(history)
         peer_name = peer_key  # fallback
         if peer_key in state.peer_list:
             peer_name = state.peer_list[peer_key].name
         unread = state.unread_counts.get(peer_key, 0)
-        first_unread = state.first_unread.get(peer_key, len(history) - unread)
+        first_unread = state.first_unread.get(peer_key, total - unread)
+        start = max(0, min(total - last_n, first_unread))
+        shown = history[start:]
 
-    if not history:
+    if not total:
         print_info(f"Chưa có tin nhắn với {peer_name}.")
         return
 
-    start = max(0, min(len(history) - last_n, first_unread))
-    shown = history[start:]
-    omitted = len(history) - len(shown)
     _print_fragments(
-        ("class:info", f"\n── Lịch sử chat với {_display_text(peer_name)} ({len(shown)}/{len(history)}) ──"),
+        ("class:info", f"\n── Lịch sử chat với {_display_text(peer_name)} ({len(shown)}/{total}) ──"),
     )
+    omitted = total - len(shown)
     if omitted > 0:
         _print_fragments(("class:history", f"  ... {omitted} tin nhắn cũ hơn ..."))
     for entry in shown:
@@ -221,7 +223,7 @@ def display_chat_history(peer_key: str, last_n: int = 20):
         remaining = max(0, state.unread_counts.get(peer_key, 0) - unread)
         state.unread_counts[peer_key] = remaining
         if remaining and unread:
-            state.first_unread[peer_key] = len(history)
+            state.first_unread[peer_key] = total
         elif not remaining:
             state.first_unread.pop(peer_key, None)
 

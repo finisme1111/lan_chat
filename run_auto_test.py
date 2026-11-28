@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from contextlib import ExitStack, nullcontext
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -19,10 +20,11 @@ SCRIPT = Path(__file__).resolve()
 
 
 class ProcessMonitor:
-    def __init__(self, name, port, udp_port, directory):
+    def __init__(self, name, port, udp_port, directory, *, udp_targets=()):
         self.name = name
         self.port = port
         self.udp_port = udp_port
+        self.udp_targets = udp_targets
         self.directory = directory
         self.proc = None
         self.logs = []
@@ -30,9 +32,10 @@ class ProcessMonitor:
         self.reader = None
 
     def start(self):
+        udp_config = ",".join(map(str, (self.udp_port, *self.udp_targets)))
         self.proc = subprocess.Popen(
             [
-                sys.executable, "-B", str(SCRIPT), "--peer", str(self.udp_port),
+                sys.executable, "-B", str(SCRIPT), "--peer", udp_config,
                 "--name", self.name, "--port", str(self.port), "--data-dir", str(self.directory),
                 "--download-quota-gib", str(TEST_QUOTA_GIB),
             ],
@@ -95,11 +98,11 @@ class ProcessMonitor:
         self.proc.stdout.close()
 
 
-def _test_ports(count):
+def _test_ports(count, udp_count=1):
     with ExitStack() as stack:
         sockets = [
             stack.enter_context(socket.socket(socket.AF_INET, kind))
-            for kind in [socket.SOCK_STREAM] * count + [socket.SOCK_DGRAM]
+            for kind in [socket.SOCK_STREAM] * count + [socket.SOCK_DGRAM] * udp_count
         ]
         for sock in sockets:
             sock.bind(("127.0.0.1", 0))
@@ -161,11 +164,24 @@ def _install_controls(main, tcp):
     main.handle_command = controlled_command
 
 
-def _run_loopback_peer(udp_port):
+def _configure_peer_output():
+    """Render to the QA subprocess pipe, including notices printed by workers."""
+    from prompt_toolkit.output.plain_text import PlainTextOutput
+
+    import ui_handler
+
+    ui_handler.print_formatted_text = partial(
+        ui_handler.print_formatted_text, output=PlainTextOutput(sys.stdout),
+    )
+
+
+def _run_loopback_peer(udp_port, udp_targets=()):
     """Giới hạn socket của test peer, giữ nguyên cấu hình của ứng dụng khi chạy bình thường."""
     import main
     import tcp_handler
     import udp_handler
+
+    discovery_addr = "127.0.0.1" if udp_targets else udp_handler.UDP_LOOPBACK_ADDR
 
     class LineInputSession:
         """Use line input for network assertions; ANSI redraw has its own PTY test."""
@@ -185,7 +201,7 @@ def _run_loopback_peer(udp_port):
             if self.family == socket.AF_INET:
                 host, port = address
                 if not host and self.type == socket.SOCK_DGRAM and port != 0:
-                    host = "127.255.255.255"
+                    host = discovery_addr
                 address = (host or "127.0.0.1", port)
                 if not address[0].startswith("127."):
                     raise ValueError("Test chỉ cho phép bind IPv4 loopback.")
@@ -204,27 +220,47 @@ def _run_loopback_peer(udp_port):
         def sendto(self, data, address):
             if self.family == socket.AF_INET and not address[0].startswith("127."):
                 raise ValueError("Test chỉ cho phép gửi UDP tới IPv4 loopback.")
+            if udp_targets and self.type == socket.SOCK_DGRAM and address == (discovery_addr, udp_port):
+                # Winsock cannot bind the loopback broadcast address. Send the
+                # original datagram to each QA listener on its own loopback port.
+                error = None
+                for target_port in udp_targets:
+                    try:
+                        super().sendto(data, (discovery_addr, target_port))
+                    except OSError as exc:
+                        error = exc
+                if error is not None:
+                    raise error
+                return len(data)
             return super().sendto(data, address)
 
     socket.socket = LoopbackSocket
     udp_handler.UDP_PORT = udp_port
-    udp_handler.UDP_BROADCAST_ADDR = udp_handler.UDP_LOOPBACK_ADDR
+    udp_handler.UDP_BROADCAST_ADDR = udp_handler.UDP_LOOPBACK_ADDR = discovery_addr
     main.UDP_PORT = udp_port
     main.get_local_ip = lambda: "127.0.0.1"
-    main.create_prompt_session = LineInputSession
-    main.patch_stdout = nullcontext
+    main._interactive_console = lambda _: nullcontext(LineInputSession())
+    _configure_peer_output()
     _install_controls(main, tcp_handler)
     main.main()
 
 
-def run_tests():
+def run_tests(*, use_udp_unicast: bool = sys.platform == "win32"):
     with TemporaryDirectory(prefix="lan-chat-test-") as directory:
         root = Path(directory)
-        quan_port, minh_port, an_port, udp_port = _test_ports(3)
-        quan = ProcessMonitor("Quan", quan_port, udp_port, root / "quan")
-        minh = ProcessMonitor("Minh", minh_port, udp_port, root / "minh")
-        an = ProcessMonitor("An", an_port, udp_port, root / "an")
-        peers = (quan, minh, an)
+        peer_names = ("Quan", "Minh", "An")
+        tcp_count = len(peer_names)
+        ports = _test_ports(tcp_count, udp_count=tcp_count if use_udp_unicast else 1)
+        tcp_ports, udp_ports = ports[:tcp_count], ports[tcp_count:]
+        udp_targets = udp_ports if use_udp_unicast else ()
+        listen_ports = udp_ports if use_udp_unicast else udp_ports * tcp_count
+        peers = tuple(
+            ProcessMonitor(name, port, udp_port, root / name.lower(), udp_targets=udp_targets)
+            for name, port, udp_port in zip(peer_names, tcp_ports, listen_ports, strict=True)
+        )
+        quan, minh, an = peers
+        transport = "unicast trên 127.0.0.1" if use_udp_unicast else "broadcast IPv4 loopback"
+        print(f"[INFO] UDP integration transport: {transport}", flush=True)
         for peer in peers:
             peer.directory.mkdir()
 
@@ -241,10 +277,14 @@ def run_tests():
 
         def discovery():
             for observer in peers:
-                for subject in peers:
-                    if observer is not subject:
-                        observer.expect(f"{subject.name} (127.0.0.1:{subject.port}) đã online", timeout=10)
-                        list_row(observer, subject)
+                others = tuple(subject for subject in peers if subject is not observer)
+                for subject in others:
+                    observer.expect(f"{subject.name} (127.0.0.1:{subject.port}) đã online", timeout=10)
+                start = observer.checkpoint()
+                observer.send("/list")
+                observer.expect(f"Danh sách Peer Online ({len(others)} người)", start=start)
+                for subject in others:
+                    list_row(observer, subject)
 
         def links(observer, subject):
             start = observer.checkpoint()
@@ -288,7 +328,7 @@ def run_tests():
                     start = quan.checkpoint()
                     quan.send("/list")
                     if quan.wait_for(
-                        lambda line: f"Minh (127.0.0.1:{minh_port})" in line and presence in line,
+                        lambda line: f"Minh (127.0.0.1:{minh.port})" in line and presence in line,
                         start=start, timeout=0.5,
                     ):
                         break
@@ -315,15 +355,19 @@ def run_tests():
             an.expect("Đã kết nối với Quan", start=start)
             start = quan.checkpoint()
             an.send("Tin chưa đọc từ An")
-            quan.expect("Tin nhắn mới từ An: Tin chưa đọc từ An", start=start)
+            quan.expect("Tin nhắn mới từ An: Tin chưa đọc từ An (1 chưa đọc)", start=start)
+            start = quan.checkpoint()
+            an.send("Tin chưa đọc thứ hai từ An")
+            quan.expect("Tin nhắn mới từ An: Tin chưa đọc thứ hai từ An (2 chưa đọc)", start=start)
 
             number, row = list_row(quan, an)
-            if "1 chưa đọc" not in row:
+            if "2 chưa đọc" not in row:
                 raise AssertionError(f"Sai unread counter: {row}")
             start = quan.checkpoint()
             quan.send(f"/chat {number}")
             quan.expect("Lịch sử chat với An", start=start)
             quan.expect("Tin chưa đọc từ An", start=start)
+            quan.expect("Tin chưa đọc thứ hai từ An", start=start)
             _, row = list_row(quan, an)
             if "chưa đọc" in row:
                 raise AssertionError(f"Unread counter chưa được xóa: {row}")
@@ -420,7 +464,7 @@ def run_tests():
             start = quan.checkpoint()
             quan.send("/list")
             quan.expect("Danh sách Peer Online (1 người)", start=start)
-            quan.expect(f"Minh (127.0.0.1:{minh_port})", start=start)
+            quan.expect(f"Minh (127.0.0.1:{minh.port})", start=start)
 
         def quota():
             filename = "quota.bin"
@@ -441,6 +485,19 @@ def run_tests():
             start = minh.checkpoint()
             minh.send("/help")
             minh.expect("Lệnh Discovery", start=start)
+
+        def stalled_chat_frame():
+            start = minh.checkpoint()
+            with socket.create_connection(("127.0.0.1", minh.port), timeout=3) as conn:
+                port = conn.getsockname()[1]
+                conn.sendall(f"HELLO|QA-stall|{port}|CHAT|MSG|4|a".encode("ascii"))
+                minh.expect("QA-stall đã kết nối vào trò chuyện", start=start)
+                minh.send("/help")
+                minh.expect("Lệnh Discovery", start=start)
+                conn.settimeout(15)
+                if conn.recv(1) != b"":
+                    raise AssertionError("Receiver chưa đóng socket khi payload CHAT bị kẹt")
+                minh.expect("Kết nối với QA-stall đã bị ngắt", start=start)
 
         def disconnect():
             start = minh.checkpoint()
@@ -466,6 +523,7 @@ def run_tests():
             ("Truyền file, ACK và SHA-256", file_transfer),
             ("Quota downloads từ chối trước payload", quota),
             ("Từ chối header không hợp lệ", invalid_header),
+            ("Timeout payload CHAT trên TCP loopback", stalled_chat_frame),
             ("Hủy upload bằng /quit và dọn file tạm", cancel_upload),
             ("Tự reconnect khi UDP presence còn hoạt động", reconnect),
             ("Peer timeout và danh sách sau expiry", expire_peer),
@@ -506,8 +564,8 @@ def run_tests():
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--peer"]:
-        port = int(sys.argv[2])
+        port, *udp_targets = map(int, sys.argv[2].split(","))
         del sys.argv[1:3]
-        _run_loopback_peer(port)
+        _run_loopback_peer(port, udp_targets)
     else:
         raise SystemExit(run_tests())

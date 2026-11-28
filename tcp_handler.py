@@ -63,6 +63,10 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 65536
 CHAT_CONNECT_TIMEOUT = 5.0
 CHAT_WRITE_TIMEOUT = 10.0
+CHAT_HEADER_TIMEOUT = 10.0
+CHAT_PAYLOAD_IDLE_TIMEOUT = 10.0
+CHAT_PAYLOAD_TOTAL_TIMEOUT = 60.0
+_CHAT_READ_SELECT_INTERVAL = 0.1 if sys.platform == "win32" else None
 FILE_IO_TIMEOUT = 10.0
 HANDSHAKE_TIMEOUT = 10.0
 MAX_INCOMING_WORKERS = 32
@@ -72,7 +76,7 @@ MAX_FILE_SIZE = 2 * 1024**3
 DOWNLOADS_DIR = "downloads"
 
 # Callbacks hiển thị lên giao diện console
-_msg_cb: Optional[Callable[[str, str, str, bool], None]] = None
+_msg_cb: Optional[Callable[[str, str, str, int | None], None]] = None
 _system_cb: Optional[Callable[[str], None]] = None
 _file_sender_lock = threading.Lock()
 _file_sender: Optional[threading.Thread] = None
@@ -89,24 +93,11 @@ _CONNECT_IN_PROGRESS = {
 # Các hàm đọc dữ liệu Socket mức thấp có bảo vệ (Low-level Helpers)
 # ---------------------------------------------------------------------------
 
-def _recv_field(sock: socket.socket, deadline: Optional[float] = None) -> str:
-    """
-    Đọc từng byte cho đến khi gặp ký tự phân tách '|'.
-    Chống DoS: Nếu đọc quá MAX_FIELD_LEN (4KB) mà chưa thấy '|', ném ValueError.
-    Bắt lỗi ngắt kết nối và chuyển thành ConnectionResetError.
-    """
+def _read_field(recv: Callable[[int], bytes]) -> str:
+    """Read one UTF-8 field without consuming any bytes of the next field."""
     buf = bytearray()
     while True:
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Hết thời gian đọc header TCP.")
-            sock.settimeout(remaining)
-        try:
-            ch = sock.recv(1)
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
-            raise ConnectionResetError(f"Lỗi kết nối khi đọc trường dữ liệu: {e}")
-
+        ch = recv(1)
         if not ch:
             raise ConnectionResetError("Đối tác đã đóng kết nối đột ngột.")
 
@@ -121,21 +112,80 @@ def _recv_field(sock: socket.socket, deadline: Optional[float] = None) -> str:
             raise ValueError(f"Độ dài trường header vượt quá giới hạn an toàn ({MAX_FIELD_LEN} bytes).")
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    """
-    Đọc chính xác n bytes từ socket bằng vòng lặp.
-    Đảm bảo không bị thiếu hụt dữ liệu do phân mảnh gói tin TCP (TCP chunking).
-    """
+def _recv_field(sock: socket.socket, deadline: float) -> str:
+    """Read a field during handshake or FILE_ACK, before sharing the socket."""
+    def recv(size: int) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Hết thời gian đọc header TCP.")
+        sock.settimeout(remaining)
+        return sock.recv(size)
+
+    return _read_field(recv)
+
+
+def _recv_chat_before(sock: socket.socket, size: int, deadline: float) -> bytes:
+    # CHAT has one reader and a concurrent writer. Keep the socket mode unchanged.
+    while True:
+        if state.stop_event.is_set():
+            raise ConnectionAbortedError("Đang đóng ứng dụng.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        wait = remaining
+        if _CHAT_READ_SELECT_INTERVAL is not None:
+            # Winsock shutdown alone may leave an already-blocked select waiting.
+            wait = min(wait, _CHAT_READ_SELECT_INTERVAL)
+        if not select.select([sock], [], [], wait)[0]:
+            continue
+
+        if state.stop_event.is_set():
+            raise ConnectionAbortedError("Đang đóng ứng dụng.")
+        chunk = sock.recv(size)
+        if time.monotonic() < deadline:
+            return chunk
+        break
+    raise TimeoutError("Hết thời gian nhận frame CHAT.")
+
+
+def _recv_chat_header(sock: socket.socket) -> tuple[str, int]:
+    deadline = None
+
+    def recv(size: int) -> bytes:
+        nonlocal deadline
+        if deadline is None:
+            # An established connection can stay idle between frames.
+            first_byte = sock.recv(size)
+            deadline = time.monotonic() + CHAT_HEADER_TIMEOUT
+            return first_byte
+        return _recv_chat_before(sock, size, deadline)
+
+    msg_type = _read_field(recv)
+    if msg_type != MSG_TYPE_MSG:
+        return msg_type, 0
+
+    length_str = _read_field(recv)
+    try:
+        length = int(length_str)
+        if not 0 <= length <= MAX_MSG_LEN:
+            raise ValueError(f"Độ dài tin nhắn không hợp lệ: {length}")
+    except ValueError as e:
+        raise ValueError(f"Header MSG sai cú pháp: {e}") from e
+    return msg_type, length
+
+
+def _recv_chat_payload(sock: socket.socket, n: int) -> bytes:
+    started = time.monotonic()
+    total_deadline = started + CHAT_PAYLOAD_TOTAL_TIMEOUT
+    idle_deadline = started + CHAT_PAYLOAD_IDLE_TIMEOUT
     buf = bytearray()
     while len(buf) < n:
-        try:
-            chunk = sock.recv(min(n - len(buf), CHUNK_SIZE))
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
-            raise ConnectionResetError(f"Lỗi kết nối khi đọc dữ liệu payload: {e}")
-
+        chunk = _recv_chat_before(sock, min(n - len(buf), CHUNK_SIZE), min(total_deadline, idle_deadline))
         if not chunk:
             raise ConnectionResetError(f"Kết nối bị đứt: mong đợi {n} bytes nhưng chỉ nhận được {len(buf)} bytes.")
         buf += chunk
+        idle_deadline = time.monotonic() + CHAT_PAYLOAD_IDLE_TIMEOUT
     return bytes(buf)
 
 
@@ -228,15 +278,16 @@ def _register_chat_connection(
     return winner
 
 
-def _cleanup_connection(peer_key: str, sock: socket.socket) -> bool:
-    """Close this socket and clear the session only if it still owns the entry."""
+def _cleanup_connection(peer_key: str, sock: socket.socket, *, close_unregistered: bool = True) -> bool:
+    """Clear the session only if this socket still owns the entry."""
     with state.conn_lock:
         current = state.connections.get(peer_key)
         removed = current is not None and current.sock is sock
         if removed:
             del state.connections[peer_key]
             state.reset_partner_if(peer_key)
-    _close_chat_socket(sock)
+    if removed or close_unregistered:
+        _close_chat_socket(sock)
     return removed
 
 
@@ -449,20 +500,10 @@ def _receiver_loop(sock: socket.socket, peer_key: str, peer_name_hint: str = "")
     notice = None
     try:
         while not state.stop_event.is_set():
-            # 1. Đọc loại frame
-            msg_type = _recv_field(sock)
+            msg_type, length = _recv_chat_header(sock)
 
             if msg_type == MSG_TYPE_MSG:
-                # Format: MSG|<length>|<content>
-                length_str = _recv_field(sock)
-                try:
-                    length = int(length_str)
-                    if length < 0 or length > MAX_MSG_LEN:
-                        raise ValueError(f"Độ dài tin nhắn không hợp lệ: {length}")
-                except ValueError as e:
-                    raise ValueError(f"Header MSG sai cú pháp: {e}")
-
-                content_bytes = _recv_exact(sock, length)
+                content_bytes = _recv_chat_payload(sock, length)
                 content = content_bytes.decode("utf-8", errors="replace")
 
                 timestamp = time.strftime("%H:%M:%S")
@@ -470,19 +511,19 @@ def _receiver_loop(sock: socket.socket, peer_key: str, peer_name_hint: str = "")
 
                 with state.lock:
                     history = state.chat_history.setdefault(peer_key, [])
-                    is_current = (state.current_partner == peer_key)
-                    if not is_current:
-                        unread = state.unread_counts.get(peer_key, 0)
-                        if unread == 0:
+                    unread_count = None
+                    if state.current_partner != peer_key:
+                        unread_count = state.unread_counts.get(peer_key, 0) + 1
+                        if unread_count == 1:
                             state.first_unread[peer_key] = len(history)
-                        state.unread_counts[peer_key] = unread + 1
+                        state.unread_counts[peer_key] = unread_count
                     history.append(log_entry)
 
                 if _msg_cb:
-                    _msg_cb(peer_key, peer_name, content, is_current)
+                    _msg_cb(peer_key, peer_name, content, unread_count)
 
             elif msg_type == MSG_TYPE_BYE:
-                # Đối tác chủ động thông báo rời đi
+                notice = f"[*] Kết nối với {peer_name} đã bị ngắt."
                 break
 
             else:
@@ -501,8 +542,11 @@ def _receiver_loop(sock: socket.socket, peer_key: str, peer_name_hint: str = "")
 
     finally:
         removed = _cleanup_connection(peer_key, sock)
-        if removed and notice and _system_cb and not state.stop_event.is_set():
-            _system_cb(notice)
+        if removed and notice and _system_cb:
+            with state.conn_lock:
+                should_notify = peer_key not in state.connections and not state.stop_event.is_set()
+            if should_notify:
+                _system_cb(notice)
 
 
 # ---------------------------------------------------------------------------
@@ -546,10 +590,20 @@ def _handle_incoming(conn: socket.socket, addr: Tuple[str, int]):
                 if _register_chat_connection(peer_key, peer_ip, peer_tcp_port, candidate) is not candidate:
                     return
 
-                _restore_selected_peer(peer_key, expected_socket=conn)
-                logger.info(f"[TCP] Chấp nhận kết nối CHAT từ {peer_name} ({peer_key})")
-                if _system_cb:
-                    _system_cb(f"[*] {peer_name} đã kết nối vào trò chuyện.")
+                ready_for_receiver = False
+                try:
+                    _restore_selected_peer(peer_key, expected_socket=conn)
+                    logger.info(f"[TCP] Chấp nhận kết nối CHAT từ {peer_name} ({peer_key})")
+                    if _system_cb:
+                        _system_cb(f"[*] {peer_name} đã kết nối vào trò chuyện.")
+                    ready_for_receiver = True
+                except Exception:
+                    logger.exception("[TCP] Không thể hoàn tất khởi tạo CHAT từ %s.", peer_key)
+                    return
+                finally:
+                    if not ready_for_receiver:
+                        # Arbitration or shutdown may already have retired this socket.
+                        _cleanup_connection(peer_key, conn, close_unregistered=False)
 
                 _receiver_loop(conn, peer_key, peer_name_hint=peer_name)
             else:
@@ -768,6 +822,12 @@ def send_file(
             if filesize > MAX_FILE_SIZE:
                 raise OSError(f"File vượt quá {MAX_FILE_SIZE} bytes.")
 
+            try:
+                header = encode_file_header(filename, filesize)
+            except UnicodeEncodeError:
+                logger.error("[TCP] Không thể mã hóa tên file %r thành UTF-8.", filename)
+                return FileSendResult.FAILED
+
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 with _file_sender_lock:
                     if state.stop_event.is_set():
@@ -777,7 +837,7 @@ def send_file(
                     _connect_socket(sock, endpoint, FILE_IO_TIMEOUT)
                     hello = f"{MSG_TYPE_HELLO}|{normalize_peer_name(state.my_name)}|{state.my_tcp_port}|{MSG_TYPE_FILE}|"
                     sock.sendall(hello.encode("utf-8"))
-                    sock.sendall(encode_file_header(filename, filesize))
+                    sock.sendall(header)
 
                     sent_bytes = 0
                     while sent_bytes < filesize and not state.stop_event.is_set():
@@ -880,7 +940,7 @@ def _reconnect_worker():
 
 
 def start_tcp_threads(
-    msg_callback: Optional[Callable[[str, str, str, bool], None]] = None,
+    msg_callback: Optional[Callable[[str, str, str, int | None], None]] = None,
     system_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[threading.Thread, threading.Thread]:
     """
